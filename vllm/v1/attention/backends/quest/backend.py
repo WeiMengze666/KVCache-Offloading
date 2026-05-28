@@ -232,3 +232,60 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 residency=residency,
                 cpu_store=cpu_store,
             )
+
+    @classmethod
+    def bind_runtime(
+        cls,
+        *,
+        vllm_config,
+        kv_cache_config,
+        kv_caches: dict[str, torch.Tensor],
+        layers: dict[str, object],
+    ) -> None:
+        """Single Phase E entry point called from GPUModelRunner.
+
+        1. No-op when quest_config is disabled.
+        2. Run validate_quest_configuration; raise ValueError on failure.
+        3. Filter layers to those bound to QuestSparseOffloadBackend.
+        4. Compute (block_size, num_kv_heads, head_size, dtype) from the
+           Quest layers' KV cache spec — guaranteed homogeneous because
+           QuestKVCacheSpec.merge enforces equality.
+        5. Call init_runtime_state with the kv_caches dict so each
+           TierManager points into the vLLM-allocated tensor.
+        """
+        quest_config = getattr(vllm_config, "quest_config", None)
+        if quest_config is None or not quest_config.enabled:
+            return
+
+        errors = cls.validate_quest_configuration(
+            model_config=vllm_config.model_config,
+            cache_config=vllm_config.cache_config,
+            quest_config=quest_config,
+        )
+        if errors:
+            raise ValueError(
+                "QuestSparseOffloadBackend configuration is invalid:\n"
+                + "\n".join(f"  - {e}" for e in errors)
+            )
+
+        quest_layers_list = [
+            layer for layer in layers.values()
+            if getattr(layer, "attn_backend", None) is cls
+            and layer.layer_idx not in set(quest_config.full_kv_layers)
+        ]
+        if not quest_layers_list:
+            return
+
+        sample = quest_layers_list[0]
+        block_size = vllm_config.cache_config.block_size
+
+        cls.init_runtime_state(
+            layers=list(layers.values()),
+            block_size=block_size,
+            num_kv_heads=sample.num_kv_heads,
+            head_size=sample.head_size,
+            max_blocks_total=kv_cache_config.num_blocks,
+            dtype=sample.kv_cache_torch_dtype,
+            quest_config=quest_config,
+            kv_caches=kv_caches,
+        )
