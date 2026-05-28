@@ -154,7 +154,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
         max_blocks_total: int,
         dtype: torch.dtype,
         quest_config,
-        kv_caches: "dict[str, torch.Tensor] | None" = None,
+        kv_caches: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Construct the shared BlockSummaryStore + CpuKvBackingStore + per-
         layer TierManager objects, attach a `tier_manager` attribute to each
@@ -212,6 +212,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
             if kv_caches is not None and layer_name in kv_caches:
                 full = kv_caches[layer_name]
                 # FA layout: (num_blocks, 2, block_size, num_kv_heads, head_size)
+                # Zero-copy slice views into the vLLM-allocated tensor.
                 gpu_k = full[:, 0]
                 gpu_v = full[:, 1]
                 gpu_budget = full.shape[0]

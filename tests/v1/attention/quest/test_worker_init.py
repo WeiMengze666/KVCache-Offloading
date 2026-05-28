@@ -96,9 +96,9 @@ def test_init_runtime_state_uses_provided_kv_caches(cuda):
 
     layers = [_layer(i) for i in range(3)]
     # name-keyed dict simulating init_kv_cache's return value
-    layer_names = ["layer.2", "layer.3"]  # full_kv_layers=[0,1] -> quest=2,3
-    layers[2].layer_name = "layer.2"
-    layers[3 - 1].layer_name = layer_names[1]  # ensures attribute exists
+    # full_kv_layers=[0,1] -> quest layers are index 2 only (range(3) gives 0,1,2)
+    layer_names = ["layer.2"]
+    layers[2].layer_name = layer_names[0]
     quest_cfg = QuestConfig(
         enabled=True, full_kv_layers=[0, 1],
         gpu_cache_blocks_per_seq=4, cpu_cache_blocks=4,
@@ -113,7 +113,6 @@ def test_init_runtime_state_uses_provided_kv_caches(cuda):
         )
         for name in layer_names
     }
-    layers[2].layer_name = layer_names[0]
 
     QuestSparseOffloadBackend.init_runtime_state(
         layers=layers,
