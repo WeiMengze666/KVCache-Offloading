@@ -1,0 +1,13 @@
+Phase B regression baseline.
+- All tests under tests/v1/attention/quest/ pass (alignment test gated by
+  VLLM_QUEST_RUN_ALIGNMENT=1; test_engine_args.py 6 failures pre-exist on
+  feat/quest-phase-a HEAD due to env-state device/torch detection issue,
+  not Phase B regressions).
+- tests/v1/attention/ outside quest/: same pass/error split observed on
+  feat/quest-phase-a HEAD (env-state, not Phase B).
+- Phase A "default path zero impact" tests still pass under Phase B's
+  edits to vllm/model_executor/layers/attention/attention.py — lazy
+  imports keep the default vLLM import graph untouched.
+- R1 spike (sparse_block_table == physical gather, bitwise) remains the
+  load-bearing correctness proof for Task 13/14's algorithmic decomposition.
+- Phase B exit confirmed by Task 17 of the implementation plan.

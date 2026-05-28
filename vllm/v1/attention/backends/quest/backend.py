@@ -98,3 +98,125 @@ class QuestSparseOffloadBackend(AttentionBackend):
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         return attn_type == AttentionType.DECODER
+
+    @classmethod
+    def validate_quest_configuration(
+        cls,
+        *,
+        model_config,
+        cache_config,
+        quest_config,
+    ) -> list[str]:
+        """Return [] when this configuration is acceptable, else a list of
+        human-readable reasons. Phase B helper for unit-testable validation;
+        Phase E will pin this onto the actual selector wiring.
+        """
+        from vllm.v1.attention.backends.quest.compatibility import (
+            check_model_compat,
+        )
+
+        if quest_config is None or not quest_config.enabled:
+            return []
+
+        errors: list[str] = []
+
+        if cache_config.block_size % 256 != 0:
+            errors.append(
+                f"cache_config.block_size={cache_config.block_size} is not a "
+                "multiple of 256. flash_attn paged kernels (FA2/FA3) require "
+                "block_size % 256 == 0. Set --block-size 256 or larger."
+            )
+
+        if quest_config.top_k > quest_config.gpu_cache_blocks_per_seq:
+            errors.append(
+                f"top_k ({quest_config.top_k}) > gpu_cache_blocks_per_seq "
+                f"({quest_config.gpu_cache_blocks_per_seq}); the working set "
+                "must fit the selected blocks."
+            )
+
+        compat = check_model_compat(model_config)
+        if compat:
+            if quest_config.unsupported_model_policy == "error":
+                errors.extend(compat)
+            # else 'fallback': selector will pick the default backend; we
+            # silently refuse this one without surfacing errors.
+
+        return errors
+
+    @classmethod
+    def init_runtime_state(
+        cls,
+        *,
+        layers,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        max_blocks_total: int,
+        dtype: torch.dtype,
+        quest_config,
+    ) -> None:
+        """Construct the shared BlockSummaryStore + CpuKvBackingStore + per-
+        layer TierManager objects, attach a `tier_manager` attribute to each
+        Quest layer (full-KV layers are left untouched)."""
+        from vllm.v1.attention.backends.quest.cache.block_summary import (
+            BlockSummaryStore,
+        )
+        from vllm.v1.attention.backends.quest.cache.cpu_backing_store import (
+            CpuKvBackingStore,
+        )
+        from vllm.v1.attention.backends.quest.cache.residency import (
+            BlockResidency,
+        )
+        from vllm.v1.attention.backends.quest.cache.tier_manager import (
+            TierManager,
+        )
+
+        if not quest_config.enabled:
+            return
+
+        full_set = set(quest_config.full_kv_layers)
+        quest_layers = [l for l in layers if l.layer_idx not in full_set]
+        if not quest_layers:
+            return
+
+        num_quest = len(quest_layers)
+        page_bytes = (
+            2 * block_size * num_kv_heads * head_size
+            * torch.tensor([], dtype=dtype).element_size()
+        )
+        cpu_blocks = quest_config.resolve_cpu_blocks_per_layer(
+            page_size_bytes=page_bytes, num_quest_layers=num_quest,
+        )
+
+        summary = BlockSummaryStore(
+            num_layers=num_quest,
+            max_blocks=max_blocks_total,
+            block_size=block_size, num_kv_heads=num_kv_heads,
+            head_size=head_size, dtype=dtype, device="cuda",
+        )
+        cpu_store = CpuKvBackingStore(
+            num_layers=num_quest,
+            blocks_per_layer=cpu_blocks,
+            block_size=block_size, num_kv_heads=num_kv_heads,
+            head_size=head_size, dtype=dtype,
+        )
+        residency = BlockResidency(
+            num_layers=num_quest, max_blocks=max_blocks_total,
+        )
+
+        # GPU paged buffers: one per layer, sized to the working set.
+        for slot, layer in enumerate(quest_layers):
+            gpu_k = torch.empty(
+                (quest_config.gpu_cache_blocks_per_seq, block_size,
+                 num_kv_heads, head_size),
+                dtype=dtype, device="cuda",
+            )
+            gpu_v = torch.empty_like(gpu_k)
+            layer.tier_manager = TierManager(
+                layer_idx=slot,
+                gpu_budget=quest_config.gpu_cache_blocks_per_seq,
+                gpu_k=gpu_k, gpu_v=gpu_v,
+                summary_store=summary,
+                residency=residency,
+                cpu_store=cpu_store,
+            )

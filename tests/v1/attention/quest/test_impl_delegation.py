@@ -50,7 +50,10 @@ def test_forward_passes_through_to_fa_forward():
         k = torch.zeros(2, 8, 64)
         v = torch.zeros(2, 8, 64)
         kv_cache = torch.zeros(1)
+        # Prefill: max_query_len > 1. In Phase B this branch still delegates
+        # to FlashAttentionImpl.forward (spec §1: prefill is full attention).
         meta = MagicMock()
+        meta.max_query_len = 4
         out = torch.zeros(2, 8, 64)
 
         result = impl.forward(layer, q, k, v, kv_cache, meta, out)

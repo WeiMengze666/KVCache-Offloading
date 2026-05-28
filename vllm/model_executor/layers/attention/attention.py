@@ -566,6 +566,30 @@ class Attention(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Block size may get updated after model loading, refresh it
         block_size = vllm_config.cache_config.block_size
+        # Quest sparse offload: layers handled by Quest backend get a
+        # working-set sized spec unless they are in full_kv_layers (which
+        # always retain a full attention KV).
+        # Lazy import to keep the default path free of quest module loads.
+        quest_cfg = getattr(vllm_config, "quest_config", None)
+        if quest_cfg is not None and quest_cfg.enabled:
+            from vllm.v1.attention.backends.quest.backend import (
+                QuestSparseOffloadBackend,
+            )
+
+            is_quest_layer = (
+                self.attn_backend is QuestSparseOffloadBackend
+                and self.layer_idx not in quest_cfg.full_kv_layers
+            )
+            if is_quest_layer:
+                from vllm.v1.kv_cache_interface import QuestKVCacheSpec
+
+                return QuestKVCacheSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    dtype=self.kv_cache_torch_dtype,
+                    gpu_cache_blocks_per_seq=quest_cfg.gpu_cache_blocks_per_seq,
+                )
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
