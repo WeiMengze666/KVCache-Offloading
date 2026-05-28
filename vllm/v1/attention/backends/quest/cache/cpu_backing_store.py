@@ -74,11 +74,13 @@ class CpuKvBackingStore:
         cpu_slot: int,
         k_block: torch.Tensor,
         v_block: torch.Tensor,
+        non_blocking: bool = False,
     ) -> None:
-        # Synchronous D2H (Phase B). Phase C will switch to non_blocking=True
-        # with stream-aware ordering.
-        self.k[layer_idx, cpu_slot].copy_(k_block, non_blocking=False)
-        self.v[layer_idx, cpu_slot].copy_(v_block, non_blocking=False)
+        # Synchronous D2H by default (Phase B). Phase C: caller passes
+        # non_blocking=True from inside a `with torch.cuda.stream(d2h):`
+        # block.
+        self.k[layer_idx, cpu_slot].copy_(k_block, non_blocking=non_blocking)
+        self.v[layer_idx, cpu_slot].copy_(v_block, non_blocking=non_blocking)
         self._stats.store_calls += 1
 
     def load_block(
@@ -87,10 +89,13 @@ class CpuKvBackingStore:
         cpu_slot: int,
         k_dst: torch.Tensor,
         v_dst: torch.Tensor,
+        non_blocking: bool = False,
     ) -> None:
-        # Synchronous H2D (Phase B).
-        k_dst.copy_(self.k[layer_idx, cpu_slot], non_blocking=False)
-        v_dst.copy_(self.v[layer_idx, cpu_slot], non_blocking=False)
+        # Synchronous H2D by default (Phase B). Phase C: caller passes
+        # non_blocking=True from inside a `with torch.cuda.stream(h2d):`
+        # block.
+        k_dst.copy_(self.k[layer_idx, cpu_slot], non_blocking=non_blocking)
+        v_dst.copy_(self.v[layer_idx, cpu_slot], non_blocking=non_blocking)
         self._stats.load_calls += 1
 
     def stats(self) -> CpuStoreStats:

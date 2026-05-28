@@ -90,3 +90,30 @@ def test_stats_alloc_free_balance(store):
             store.free(layer, s)
     s = store.stats()
     assert s.alloc_count == s.free_count == 12
+
+
+def test_store_block_accepts_non_blocking_kwarg(store):
+    """non_blocking=True must work without raising; data must transfer
+    correctly when synchronized."""
+    k = torch.full((16, 2, 64), 7.0, dtype=torch.float16, device="cuda")
+    v = torch.full((16, 2, 64), 9.0, dtype=torch.float16, device="cuda")
+    cpu_slot = store.alloc(1)
+    store.store_block(1, cpu_slot, k, v, non_blocking=True)
+    torch.cuda.synchronize()
+    assert torch.all(store.k[1, cpu_slot] == 7.0)
+    assert torch.all(store.v[1, cpu_slot] == 9.0)
+
+
+def test_load_block_accepts_non_blocking_kwarg(store):
+    """non_blocking=True for H2D must work + roundtrip correctly."""
+    k_src = torch.full((16, 2, 64), 3.0, dtype=torch.float16, device="cuda")
+    v_src = torch.full((16, 2, 64), 5.0, dtype=torch.float16, device="cuda")
+    cpu_slot = store.alloc(2)
+    store.store_block(2, cpu_slot, k_src, v_src)
+
+    k_dst = torch.empty_like(k_src)
+    v_dst = torch.empty_like(v_src)
+    store.load_block(2, cpu_slot, k_dst, v_dst, non_blocking=True)
+    torch.cuda.synchronize()
+    assert torch.equal(k_dst, k_src)
+    assert torch.equal(v_dst, v_src)
