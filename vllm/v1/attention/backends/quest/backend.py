@@ -154,6 +154,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
         max_blocks_total: int,
         dtype: torch.dtype,
         quest_config,
+        kv_caches: "dict[str, torch.Tensor] | None" = None,
     ) -> None:
         """Construct the shared BlockSummaryStore + CpuKvBackingStore + per-
         layer TierManager objects, attach a `tier_manager` attribute to each
@@ -204,17 +205,27 @@ class QuestSparseOffloadBackend(AttentionBackend):
             num_layers=num_quest, max_blocks=max_blocks_total,
         )
 
-        # GPU paged buffers: one per layer, sized to the working set.
+        # GPU paged buffers: prefer vLLM-allocated tensor when supplied
+        # (Phase E hook). Fall back to fresh allocation for unit tests.
         for slot, layer in enumerate(quest_layers):
-            gpu_k = torch.empty(
-                (quest_config.gpu_cache_blocks_per_seq, block_size,
-                 num_kv_heads, head_size),
-                dtype=dtype, device="cuda",
-            )
-            gpu_v = torch.empty_like(gpu_k)
+            layer_name = getattr(layer, "layer_name", None)
+            if kv_caches is not None and layer_name in kv_caches:
+                full = kv_caches[layer_name]
+                # FA layout: (num_blocks, 2, block_size, num_kv_heads, head_size)
+                gpu_k = full[:, 0]
+                gpu_v = full[:, 1]
+                gpu_budget = full.shape[0]
+            else:
+                gpu_k = torch.empty(
+                    (quest_config.gpu_cache_blocks_per_seq, block_size,
+                     num_kv_heads, head_size),
+                    dtype=dtype, device="cuda",
+                )
+                gpu_v = torch.empty_like(gpu_k)
+                gpu_budget = quest_config.gpu_cache_blocks_per_seq
             layer.tier_manager = TierManager(
                 layer_idx=slot,
-                gpu_budget=quest_config.gpu_cache_blocks_per_seq,
+                gpu_budget=gpu_budget,
                 gpu_k=gpu_k, gpu_v=gpu_v,
                 summary_store=summary,
                 residency=residency,
