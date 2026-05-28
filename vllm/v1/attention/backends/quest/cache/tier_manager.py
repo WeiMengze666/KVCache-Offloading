@@ -93,7 +93,7 @@ class TierManager:
         summary_store: BlockSummaryStore,
         residency: BlockResidency,
         cpu_store: CpuKvBackingStore,
-        stream_pool: "QuestStreamPool | None" = None,
+        stream_pool: QuestStreamPool | None = None,
     ) -> None:
         self.layer_idx = layer_idx
         self.gpu_budget = gpu_budget
@@ -146,7 +146,7 @@ class TierManager:
         self,
         seq_id: int,
         logical_block_ids: torch.Tensor,
-    ) -> "torch.cuda.Event | None":
+    ) -> torch.cuda.Event | None:
         """Sync (Phase B): copies happen inline, returns None.
         Async (Phase C): copies issued on h2d_stream with non_blocking=True;
         returns an Event the caller waits on before reading the slots.
@@ -199,10 +199,18 @@ class TierManager:
         slot, evicted = self._slot_map.add(key)
         if evicted is not None:
             self._spill_to_cpu(*evicted, slot=slot)
-        # Residency state machine update is synchronous: the LOADING
-        # state means "in flight". complete_load fires after the event,
-        # but in Phase B/C the state isn't read between begin_load and
-        # complete_load by anything that would race.
+        # Residency state machine update fires synchronously, BEFORE the
+        # async H2D actually completes. This is intentional: the state
+        # tracks INTENT, not completion. The contract is:
+        #   - Caller MUST wait on the Event returned by ensure_resident
+        #     before reading gpu_k[slot] / gpu_v[slot].
+        #   - Callers that need a completion-aware view of residency
+        #     (e.g. is_on_gpu_mask before quest_selection candidate
+        #     filtering) must guard their reads with the same
+        #     wait_event(...) in the async path.
+        # Phase D may move this to a deferred-completion model; Phase B/C
+        # do not call is_on_gpu_mask between ensure_resident return and
+        # the caller's wait_event, so the hazard is dormant.
         self.residency.begin_load(self.layer_idx, bid)
         self.cpu_store.load_block(
             self.layer_idx, cpu_slot,
