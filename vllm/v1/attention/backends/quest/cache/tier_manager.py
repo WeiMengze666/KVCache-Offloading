@@ -15,6 +15,7 @@ not need to await anything. Phase C will return an Event | None.
 from __future__ import annotations
 
 from collections import OrderedDict
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -28,6 +29,9 @@ from vllm.v1.attention.backends.quest.cache.residency import (
     BlockResidency,
 )
 from vllm.v1.attention.backends.quest.cache.stats import QuestStats
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.quest.async_transfer import QuestStreamPool
 
 
 class _LRUSlotMap:
@@ -89,6 +93,7 @@ class TierManager:
         summary_store: BlockSummaryStore,
         residency: BlockResidency,
         cpu_store: CpuKvBackingStore,
+        stream_pool: "QuestStreamPool | None" = None,
     ) -> None:
         self.layer_idx = layer_idx
         self.gpu_budget = gpu_budget
@@ -97,6 +102,7 @@ class TierManager:
         self.summary_store = summary_store
         self.residency = residency
         self.cpu_store = cpu_store
+        self.stream_pool = stream_pool
 
         self._slot_map = _LRUSlotMap(capacity=gpu_budget)
         # Per-evicted (seq_id, logical_block_id) -> cpu_slot
@@ -140,50 +146,103 @@ class TierManager:
         self,
         seq_id: int,
         logical_block_ids: torch.Tensor,
-    ) -> None:
-        """For each id in logical_block_ids that is currently ON_CPU, copy
-        it back into a GPU slot (possibly evicting another block). Synchronous
-        in Phase B.
+    ) -> "torch.cuda.Event | None":
+        """Sync (Phase B): copies happen inline, returns None.
+        Async (Phase C): copies issued on h2d_stream with non_blocking=True;
+        returns an Event the caller waits on before reading the slots.
         """
         ids = logical_block_ids.cpu().tolist()
-        for bid in ids:
-            key = (seq_id, bid)
-            if key in self._slot_map:
-                # Already resident — touch LRU and continue.
-                self._slot_map.get(key)
-                continue
-            cpu_slot = self._cpu_slots.pop(key, None)
-            if cpu_slot is None:
-                raise RuntimeError(
-                    f"block {key} is neither on GPU nor in CPU pool"
-                )
-            slot, evicted = self._slot_map.add(key)
-            if evicted is not None:
-                self._spill_to_cpu(*evicted, slot=slot)
+        if self.stream_pool is None:
+            for bid in ids:
+                self._ensure_one_sync(seq_id, bid)
+            return None
 
-            self.residency.begin_load(self.layer_idx, bid)
-            self.cpu_store.load_block(
-                self.layer_idx, cpu_slot,
-                self.gpu_k[slot], self.gpu_v[slot],
+        with torch.cuda.stream(self.stream_pool.h2d_stream):
+            for bid in ids:
+                self._ensure_one_async(seq_id, bid)
+        return self.stream_pool.record_h2d_done()
+
+    def _ensure_one_sync(self, seq_id: int, bid: int) -> None:
+        key = (seq_id, bid)
+        if key in self._slot_map:
+            self._slot_map.get(key)
+            return
+        cpu_slot = self._cpu_slots.pop(key, None)
+        if cpu_slot is None:
+            raise RuntimeError(
+                f"block {key} is neither on GPU nor in CPU pool"
             )
-            self.cpu_store.free(self.layer_idx, cpu_slot)
-            self.residency.complete_load(self.layer_idx, bid)
-            self._stats.load_h2d += 1
+        slot, evicted = self._slot_map.add(key)
+        if evicted is not None:
+            self._spill_to_cpu(*evicted, slot=slot)
+        self.residency.begin_load(self.layer_idx, bid)
+        self.cpu_store.load_block(
+            self.layer_idx, cpu_slot,
+            self.gpu_k[slot], self.gpu_v[slot],
+        )
+        self.cpu_store.free(self.layer_idx, cpu_slot)
+        self.residency.complete_load(self.layer_idx, bid)
+        self._stats.load_h2d += 1
+
+    def _ensure_one_async(self, seq_id: int, bid: int) -> None:
+        """Same as _ensure_one_sync but uses non_blocking copies. Caller
+        is inside a `with torch.cuda.stream(h2d_stream):` block."""
+        key = (seq_id, bid)
+        if key in self._slot_map:
+            self._slot_map.get(key)
+            return
+        cpu_slot = self._cpu_slots.pop(key, None)
+        if cpu_slot is None:
+            raise RuntimeError(
+                f"block {key} is neither on GPU nor in CPU pool"
+            )
+        slot, evicted = self._slot_map.add(key)
+        if evicted is not None:
+            self._spill_to_cpu(*evicted, slot=slot)
+        # Residency state machine update is synchronous: the LOADING
+        # state means "in flight". complete_load fires after the event,
+        # but in Phase B/C the state isn't read between begin_load and
+        # complete_load by anything that would race.
+        self.residency.begin_load(self.layer_idx, bid)
+        self.cpu_store.load_block(
+            self.layer_idx, cpu_slot,
+            self.gpu_k[slot], self.gpu_v[slot],
+            non_blocking=True,
+        )
+        self.cpu_store.free(self.layer_idx, cpu_slot)
+        self.residency.complete_load(self.layer_idx, bid)
+        self._stats.load_h2d += 1
 
     def _spill_to_cpu(
         self, seq_id: int, logical_block_id: int, *, slot: int,
     ) -> None:
         """Snapshot gpu_k[slot]/gpu_v[slot] into the CPU pool BEFORE the
-        slot is overwritten by the new key. `slot` is the index returned
-        by `_LRUSlotMap.add` for the new key — its old contents still
-        belong to the evicted (seq_id, logical_block_id).
+        slot is overwritten by the new key.
+
+        Sync (Phase B): blocking D2H, slot is safe to overwrite on return.
+        Async (Phase C): non_blocking D2H on d2h_stream. record_stream on
+        the source tensor keeps PyTorch's caching allocator from recycling
+        the underlying memory until d2h_stream finishes the copy.
         """
         cpu_slot = self.cpu_store.alloc(self.layer_idx)
         self.residency.begin_evict(self.layer_idx, logical_block_id)
-        self.cpu_store.store_block(
-            self.layer_idx, cpu_slot,
-            self.gpu_k[slot], self.gpu_v[slot],
-        )
+        if self.stream_pool is None:
+            self.cpu_store.store_block(
+                self.layer_idx, cpu_slot,
+                self.gpu_k[slot], self.gpu_v[slot],
+            )
+        else:
+            d2h = self.stream_pool.d2h_stream
+            # Tell the allocator: don't recycle these GPU tensors until
+            # d2h_stream passes this point.
+            self.gpu_k[slot].record_stream(d2h)
+            self.gpu_v[slot].record_stream(d2h)
+            with torch.cuda.stream(d2h):
+                self.cpu_store.store_block(
+                    self.layer_idx, cpu_slot,
+                    self.gpu_k[slot], self.gpu_v[slot],
+                    non_blocking=True,
+                )
         self.residency.complete_evict(self.layer_idx, logical_block_id)
         self._cpu_slots[(seq_id, logical_block_id)] = cpu_slot
         self._stats.evict_d2h += 1
