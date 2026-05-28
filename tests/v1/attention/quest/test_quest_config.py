@@ -96,3 +96,64 @@ def test_quest_config_re_exported_from_vllm_config():
     from vllm.config.quest import QuestConfig as Direct
 
     assert ReExported is Direct
+
+
+def test_cpu_cache_gib_default_present():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig()
+    assert cfg.cpu_cache_gib is None  # opt-in; explicit is best
+    assert cfg.cpu_cache_blocks == 65536  # legacy per-layer ceiling
+
+
+def test_cpu_pool_byte_budget_setter_overrides():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(cpu_cache_gib=4)
+    cfg.validate()
+    assert cfg.cpu_cache_gib == 4
+    assert cfg.cpu_cache_blocks == 65536  # field unchanged; runtime derives
+
+
+def test_cpu_pool_byte_budget_validates_positive():
+    from vllm.config.quest import QuestConfig
+
+    with pytest.raises(ValueError, match="cpu_cache_gib"):
+        QuestConfig(cpu_cache_gib=0).validate()
+    with pytest.raises(ValueError, match="cpu_cache_gib"):
+        QuestConfig(cpu_cache_gib=-1).validate()
+
+
+def test_resolve_cpu_pool_blocks_per_layer_uses_smaller_of_two_caps():
+    """Whichever cap is tighter wins, per-layer."""
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(cpu_cache_blocks=2048, cpu_cache_gib=1)
+    # 1 GiB / page_size_bytes / num_quest_layers
+    blocks_per_layer = cfg.resolve_cpu_blocks_per_layer(
+        page_size_bytes=1024 * 1024,  # 1 MiB
+        num_quest_layers=30,
+    )
+    # gib path: floor(1 GiB / 1 MiB / 30) = floor(34.13) = 34
+    # legacy path: 2048
+    # min(2048, 34) = 34
+    assert blocks_per_layer == 34
+
+
+def test_resolve_cpu_pool_blocks_legacy_only():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(cpu_cache_blocks=128, cpu_cache_gib=None)
+    blocks_per_layer = cfg.resolve_cpu_blocks_per_layer(
+        page_size_bytes=1024 * 1024, num_quest_layers=30,
+    )
+    assert blocks_per_layer == 128
+
+
+def test_resolve_cpu_pool_zero_quest_layers_returns_zero():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig()
+    assert cfg.resolve_cpu_blocks_per_layer(
+        page_size_bytes=1024 * 1024, num_quest_layers=0,
+    ) == 0

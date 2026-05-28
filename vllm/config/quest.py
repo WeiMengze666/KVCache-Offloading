@@ -30,6 +30,17 @@ class QuestConfig:
     # GPU/CPU tiering (Phase B activates these).
     gpu_cache_blocks_per_seq: int = 256
     cpu_cache_blocks: int = 65536
+    cpu_cache_gib: int | None = None
+    """Total pinned CPU pool budget in GiB across ALL Quest layers.
+
+    When set, the runtime computes `floor(cpu_cache_gib * 1024**3 /
+    page_size_bytes / num_quest_layers)` and takes the min with
+    `cpu_cache_blocks` (the legacy per-layer ceiling). When None, only the
+    legacy ceiling applies. Tighter constraint always wins.
+
+    Set this when host RAM is the binding constraint. The legacy ceiling
+    is kept for backwards compatibility with the Transformers-side
+    configuration."""
     eviction_policy: EvictionPolicy = "lru"
 
     # Async (Phase C activates these).
@@ -64,6 +75,11 @@ class QuestConfig:
             raise ValueError(
                 f"cpu_cache_blocks must be >= 0, got {self.cpu_cache_blocks}"
             )
+        if self.cpu_cache_gib is not None and self.cpu_cache_gib <= 0:
+            raise ValueError(
+                f"cpu_cache_gib must be positive when set, "
+                f"got {self.cpu_cache_gib}"
+            )
         if self.eviction_policy not in ("lru", "arc"):
             raise ValueError(
                 f"eviction_policy must be 'lru' or 'arc', "
@@ -93,3 +109,17 @@ class QuestConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "QuestConfig":
         return cls(**data)
+
+    def resolve_cpu_blocks_per_layer(
+        self, *, page_size_bytes: int, num_quest_layers: int,
+    ) -> int:
+        if num_quest_layers <= 0:
+            return 0
+        legacy_cap = self.cpu_cache_blocks
+        if self.cpu_cache_gib is None:
+            return legacy_cap
+        gib_cap = (
+            self.cpu_cache_gib * (1024 ** 3) // page_size_bytes
+            // num_quest_layers
+        )
+        return min(legacy_cap, gib_cap)
