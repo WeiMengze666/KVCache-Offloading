@@ -88,6 +88,7 @@ class KVCacheSpecKind(str, Enum):
     SINK_FULL_ATTENTION = "sink_full_attention"
     ENCODER_ONLY_ATTENTION = "encoder_only_attention"
     CROSS_ATTENTION = "cross_attention"
+    QUEST_ATTENTION = "quest_attention"
     UNKNOWN = "unknown"
 
 
@@ -147,6 +148,10 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
+
+    @classmethod
+    def kind(cls) -> KVCacheSpecKind:
+        return KVCacheSpecKind.UNKNOWN
 
     @property
     def page_size_bytes(self) -> int:
@@ -589,6 +594,36 @@ class MambaSpec(KVCacheSpec):
             return self.page_size_bytes * (2 + self.num_speculative_blocks)
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
+
+
+@dataclass(frozen=True, kw_only=True)
+class QuestKVCacheSpec(AttentionSpec):
+    """Per-layer KV cache spec for layers handled by the Quest backend.
+
+    Unlike FullAttentionSpec which sizes GPU memory by max_model_len, this
+    spec sizes GPU memory by `gpu_cache_blocks_per_seq` — the Quest GPU
+    working set. Evicted blocks live in pinned CPU memory managed
+    separately by the Quest backend (CpuKvBackingStore).
+    """
+
+    gpu_cache_blocks_per_seq: int
+
+    def __post_init__(self):
+        if self.gpu_cache_blocks_per_seq <= 0:
+            raise ValueError(
+                "gpu_cache_blocks_per_seq must be > 0, got "
+                f"{self.gpu_cache_blocks_per_seq}"
+            )
+
+    @classmethod
+    def kind(cls) -> KVCacheSpecKind:
+        return KVCacheSpecKind.QUEST_ATTENTION
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        # vLLM allocates GPU pool for `num_concurrent_seqs * blocks_per_seq`.
+        # For Quest layers the per-seq budget is the working set, not the
+        # full sequence length.
+        return self.gpu_cache_blocks_per_seq * self.page_size_bytes
 
 
 @dataclass(frozen=True)
