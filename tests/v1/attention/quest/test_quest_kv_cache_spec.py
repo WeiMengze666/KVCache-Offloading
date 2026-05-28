@@ -235,3 +235,18 @@ def test_attention_with_default_backend_unaffected():
     spec = Attention.get_kv_cache_spec(layer, vllm_cfg)
     assert isinstance(spec, FullAttentionSpec)
     assert not isinstance(spec, QuestKVCacheSpec)
+
+
+def test_quest_spec_is_attention_spec_for_worker_dispatch():
+    """worker/utils.py treats AttentionSpec subclasses uniformly. Verify
+    QuestKVCacheSpec is one — otherwise block-size resolution breaks."""
+    from vllm.v1.kv_cache_interface import AttentionSpec, QuestKVCacheSpec
+
+    spec = QuestKVCacheSpec(
+        block_size=256,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.float16,
+        gpu_cache_blocks_per_seq=32,
+    )
+    assert isinstance(spec, AttentionSpec)
