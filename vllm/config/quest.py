@@ -45,10 +45,46 @@ class QuestConfig:
 
     # Async (Phase C activates these).
     enable_async_prefetch: bool = False
+    """Phase C gate. When True, ensure_resident issues non_blocking=True H2D
+    on a dedicated h2d_stream and returns an event for the compute stream
+    to wait on before the kernel runs (Mode 1). When False, all transfers
+    are synchronous (Phase B behavior). Default False; flip to True to opt
+    in to async transfers."""
+
     enable_double_buffering: bool = False
+    """Phase C reserved. Currently unused — the Phase C design uses a single
+    h2d/d2h stream pair without staging buffers (each Quest layer has its
+    own GPU pool, so layer-N forward and H2D into layer-N+1 don't conflict).
+    Reserved for future expansion."""
+
     num_h2d_streams: int = 1
+    """Phase C reserved. Currently fixed at 1; multi-stream H2D is deferred."""
+
     num_d2h_streams: int = 1
+    """Phase C reserved. Currently fixed at 1."""
+
     prefetch_window_blocks: int = 0
+    """Mode 2 toggle. When > 0 and enable_async_prefetch=True, after layer N's
+    forward we speculatively prefetch layer N's top_ids into layer N+1's GPU
+    pool on the h2d_stream. Layer N+1's forward waits on the prefetch event
+    before starting.
+
+    .. warning::
+
+       Mode 2 carries a structural LRU-thrash risk. When the GPU pool is
+       full (steady state) and the speculative prefetch picks differ from
+       layer N+1's actual selection, every wrong prefetch evicts an LRU
+       block to CPU, and the actual selection then has to refetch it. In
+       the worst case (zero overlap between speculation and reality),
+       Mode 2 can be 2x slower than Mode 1.
+
+       Quest's cross-layer top-k overlap is workload-dependent and has
+       not been measured for this project. **Do not enable Mode 2
+       (prefetch_window_blocks > 0) in production without first
+       benchmarking the overlap fraction on your model.** Phase D may
+       add an overlap-threshold gate; until then, Mode 2 is best left
+       at 0.
+    """
 
     # Kernel dispatch (Phase D activates "cuda").
     selection_impl: SelectionImpl = "torch"
@@ -101,6 +137,16 @@ class QuestConfig:
             raise ValueError(
                 f"full_kv_layers must be a list of int, "
                 f"got {self.full_kv_layers!r}"
+            )
+        if self.prefetch_window_blocks < 0:
+            raise ValueError(
+                f"prefetch_window_blocks must be >= 0, "
+                f"got {self.prefetch_window_blocks}"
+            )
+        if self.prefetch_window_blocks > 0 and not self.enable_async_prefetch:
+            raise ValueError(
+                "prefetch_window_blocks > 0 (Mode 2) requires "
+                "enable_async_prefetch=True (Mode 1)."
             )
 
     def to_dict(self) -> dict[str, Any]:
