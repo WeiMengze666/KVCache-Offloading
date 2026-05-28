@@ -91,7 +91,7 @@ class QuestSparseOffloadImpl(AttentionImpl):
             layer, key, value, kv_cache, attn_metadata,
         )
         self._notify_filled_blocks_after_decode(
-            layer, key, value, attn_metadata,
+            layer, kv_cache, attn_metadata,
         )
         return self._forward_sparse_decode(
             layer, query, kv_cache, attn_metadata, output,
@@ -123,11 +123,11 @@ class QuestSparseOffloadImpl(AttentionImpl):
         )
         notify_filled_blocks_after_prefill(layer, key, value, md)
 
-    def _notify_filled_blocks_after_decode(self, layer, key, value, md):
+    def _notify_filled_blocks_after_decode(self, layer, kv_cache, md):
         from vllm.v1.attention.backends.quest.impl_helpers import (
             notify_filled_blocks_after_decode,
         )
-        notify_filled_blocks_after_decode(layer, key, value, md)
+        notify_filled_blocks_after_decode(layer, kv_cache, md)
 
     def _forward_sparse_decode(self, layer, query, kv_cache, md, output):
         from vllm.v1.attention.backends.quest.impl_helpers import (

@@ -105,3 +105,117 @@ def test_quest_layer_topk_equals_total_matches_dense_fa(cuda):
         block_table=sparse_bt, cache_seqlens=sparse_cs, causal=True,
     )
     assert torch.allclose(out_dense, out_sparse, atol=1e-3, rtol=1e-3)
+
+
+def test_run_sparse_decode_matches_dense_when_topk_equals_total(cuda):
+    pytest.importorskip("flash_attn")
+    from flash_attn import flash_attn_with_kvcache
+    from unittest.mock import MagicMock
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.quest.cache.block_summary import (
+        BlockSummaryStore,
+    )
+    from vllm.v1.attention.backends.quest.cache.residency import (
+        BlockResidency,
+    )
+    from vllm.v1.attention.backends.quest.cache.cpu_backing_store import (
+        CpuKvBackingStore,
+    )
+    from vllm.v1.attention.backends.quest.cache.tier_manager import (
+        TierManager,
+    )
+    from vllm.v1.attention.backends.quest.impl_helpers import (
+        run_sparse_decode,
+    )
+
+    torch.manual_seed(0)
+    block_size = 256
+    num_kv_heads = num_heads = 2
+    head_size = 64
+    num_blocks = 4
+
+    # Pretend kv_cache laid out FA-style: (num_blocks, 2, block_size, h_kv, d)
+    kv_cache = torch.randn(
+        num_blocks, 2, block_size, num_kv_heads, head_size,
+        dtype=torch.float16, device="cuda",
+    )
+    k_view = kv_cache[:, 0]
+    v_view = kv_cache[:, 1]
+
+    # Build tier manager + summary populated from kv_cache.
+    summary = BlockSummaryStore(
+        num_layers=1, max_blocks=num_blocks,
+        block_size=block_size, num_kv_heads=num_kv_heads,
+        head_size=head_size, dtype=torch.float16, device="cuda",
+    )
+    for b in range(num_blocks):
+        summary.on_block_filled(0, b, k_view[b])
+    residency = BlockResidency(num_layers=1, max_blocks=num_blocks)
+    cpu_store = CpuKvBackingStore(
+        num_layers=1, blocks_per_layer=num_blocks,
+        block_size=block_size, num_kv_heads=num_kv_heads,
+        head_size=head_size, dtype=torch.float16,
+    )
+    gpu_k = k_view.contiguous()
+    gpu_v = v_view.contiguous()
+    tm = TierManager(
+        layer_idx=0, gpu_budget=num_blocks,
+        gpu_k=gpu_k, gpu_v=gpu_v,
+        summary_store=summary, residency=residency, cpu_store=cpu_store,
+    )
+    for b in range(num_blocks):
+        tm._slot_map.add((0, b))   # mark resident in slot=b
+        residency.mark_on_gpu(0, b)
+
+    # Forward context fixture: just enough for run_sparse_decode.
+    layer = MagicMock()
+    layer.layer_idx = 0
+    layer.num_heads = num_heads
+    layer.num_kv_heads = num_kv_heads
+    layer.head_size = head_size
+    layer.scale = 1.0 / (head_size ** 0.5)
+    layer._k_scale = torch.tensor(1.0, dtype=torch.float16, device="cuda")
+    layer._v_scale = torch.tensor(1.0, dtype=torch.float16, device="cuda")
+    layer.attn_type = "decoder"
+    layer.causal = True
+    layer.tier_manager = tm   # injected by worker init in real life
+
+    # Query is 3-D `[num_actual_tokens, num_heads, head_size]` per vLLM
+    # contract (see flash_attn.py forward).
+    q = torch.randn(1, num_heads, head_size,
+                    dtype=torch.float16, device="cuda")
+    md = SimpleNamespace(
+        num_actual_tokens=1,
+        max_query_len=1,
+        slot_mapping=torch.tensor([num_blocks * block_size - 1],
+                                  dtype=torch.int64, device="cuda"),
+        block_table=torch.arange(num_blocks, dtype=torch.int32,
+                                 device="cuda").unsqueeze(0),
+        seq_lens=torch.tensor([num_blocks * block_size],
+                              dtype=torch.int32, device="cuda"),
+        max_seq_len=num_blocks * block_size,
+        quest_top_k=num_blocks,
+        quest_layer_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        sparse_block_table=None,
+    )
+    output = torch.empty(1, num_heads, head_size,
+                          dtype=torch.float16, device="cuda")
+
+    # Need a self-like impl object exposing _fa_impl ; Phase B uses it
+    # only for ad-hoc kv_scale lookup, so a shim is enough.
+    impl = SimpleNamespace(kv_cache_dtype="auto")
+
+    out = run_sparse_decode(impl, layer, q, kv_cache, md, output)
+
+    # Reference: full block_table.
+    full_bt = torch.arange(num_blocks, dtype=torch.int32,
+                           device="cuda").unsqueeze(0)
+    full_cs = torch.tensor([num_blocks * block_size],
+                           dtype=torch.int32, device="cuda")
+    ref = flash_attn_with_kvcache(
+        q.unsqueeze(1),  # (B=1, S=1, H, D) for FA's native API
+        k_view, v_view,
+        block_table=full_bt, cache_seqlens=full_cs, causal=True,
+    )
+    assert torch.allclose(out, ref.squeeze(1), atol=1e-3, rtol=1e-3)
