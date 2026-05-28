@@ -107,6 +107,28 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 logger = init_logger(__name__)
 
 
+def _invoke_quest_bind_runtime(
+    *, vllm_config, kv_cache_config, kv_caches, static_forward_context,
+) -> None:
+    """Call QuestSparseOffloadBackend.bind_runtime if Quest is enabled.
+
+    Lazy imports keep the default path's import graph free of quest
+    modules — required for Phase B's test_default_path_unchanged.py.
+    """
+    quest_config = getattr(vllm_config, "quest_config", None)
+    if quest_config is None or not quest_config.enabled:
+        return
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+    QuestSparseOffloadBackend.bind_runtime(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        kv_caches=kv_caches,
+        layers=static_forward_context,
+    )
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -445,6 +467,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.cache_config.cache_dtype,
             kernel_block_sizes,
             self.vllm_config,
+        )
+        _invoke_quest_bind_runtime(
+            vllm_config=self.vllm_config,
+            kv_cache_config=self.kv_cache_config,
+            kv_caches=kv_caches_dict,
+            static_forward_context=self.compilation_config.static_forward_context,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
