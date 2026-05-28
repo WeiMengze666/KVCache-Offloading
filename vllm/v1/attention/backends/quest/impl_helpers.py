@@ -79,6 +79,37 @@ def notify_filled_blocks_after_decode(layer, kv_cache, md) -> None:
         )
 
 
+def _next_quest_layer_idx(layer) -> int | None:
+    """Return the next Quest layer's global index, or None if `layer` is
+    the last Quest layer in the model. Reads the indices view stashed by
+    bind_runtime; if missing, returns None (Mode 2 inert).
+    """
+    indices = getattr(layer, "_quest_layer_indices_view", None)
+    if indices is None:
+        return None
+    cur = layer.layer_idx
+    after = [i for i in indices if i > cur]
+    return after[0] if after else None
+
+
+def _prefetch_window(layer) -> int:
+    """Read prefetch_window_blocks off the layer's quest_config (cached
+    by bind_runtime). Returns 0 when not set or when Mode 2 is disabled."""
+    qc = getattr(layer, "_quest_config_ref", None)
+    if qc is None:
+        return 0
+    return int(getattr(qc, "prefetch_window_blocks", 0))
+
+
+def _quest_layer_tier_manager(layer, target_layer_idx: int):
+    """Resolve the TierManager for a target layer index. Reads from the
+    forward-context registry stashed by bind_runtime."""
+    registry = getattr(layer, "_quest_layer_tm_registry", None)
+    if registry is None:
+        return None
+    return registry.get(target_layer_idx)
+
+
 def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     """Decode-step sparse path. Must equal dense FA when top_k >= num_blocks
     and no eviction has happened (proved by R1 spike)."""
@@ -93,6 +124,20 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     num_reqs = seq_lens.shape[0]
     top_k = int(getattr(md, "quest_top_k", 64))
 
+    # Mode 2 preamble: if a previous layer scheduled a prefetch into this
+    # layer's pool, wait on it before ensure_resident decides which extra
+    # blocks to fetch. The wait is no-op when no event was registered
+    # (Mode 1, or layer 0 of a fresh seq).
+    pool = getattr(tm, "stream_pool", None)
+    if pool is not None:
+        for req_idx in range(num_reqs):
+            prefetch_event = pool.pop_prefetch_event(
+                seq_id=req_idx, target_layer_idx=layer.layer_idx,
+            )
+            if prefetch_event is not None:
+                torch.cuda.current_stream().wait_event(prefetch_event)
+
+    per_req_top_ids: list[torch.Tensor] = []
     out_chunks = []
     for req_idx in range(num_reqs):
         sl = int(seq_lens[req_idx].item())
@@ -110,7 +155,15 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
             num_kv_groups=layer.num_heads // layer.num_kv_heads,
             top_k=min(top_k, num_blocks),
         )
-        tm.ensure_resident(seq_id=req_idx, logical_block_ids=top_ids)
+        per_req_top_ids.append(top_ids)
+        # Wait on H2D completion before kernel reads the slots. Sync mode
+        # returns None (no wait); async mode returns an Event we must
+        # serialize the compute stream against.
+        h2d_event = tm.ensure_resident(
+            seq_id=req_idx, logical_block_ids=top_ids,
+        )
+        if h2d_event is not None:
+            torch.cuda.current_stream().wait_event(h2d_event)
         # Translate logical block ids to physical GPU slots.
         slots = torch.tensor(
             [tm.logical_to_slot(seq_id=req_idx, logical_block_id=int(b))
@@ -133,4 +186,24 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
 
     out = torch.cat(out_chunks, dim=0)
     output.copy_(out.reshape_as(output))
+
+    # Mode 2 postamble: speculatively prefetch the same top_ids into the
+    # next layer's pool. Window > 0 gates Mode 2; window == 0 keeps
+    # Mode 1 (no speculation).
+    if pool is not None:
+        next_layer_idx = _next_quest_layer_idx(layer)
+        if next_layer_idx is not None:
+            window = _prefetch_window(layer)
+            if window > 0:
+                next_tm = _quest_layer_tier_manager(layer, next_layer_idx)
+                if next_tm is not None:
+                    for req_idx, top_ids in enumerate(per_req_top_ids):
+                        # Limit how many ids we prefetch to bound the
+                        # LRU-thrash exposure (see QuestConfig docstring).
+                        ids = top_ids[: window]
+                        next_tm.prefetch_top_ids(
+                            seq_id=req_idx,
+                            logical_block_ids=ids,
+                        )
+
     return output

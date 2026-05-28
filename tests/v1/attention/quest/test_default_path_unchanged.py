@@ -53,3 +53,25 @@ def test_vllm_config_can_be_built_without_quest_config():
         assert field.default_factory() is None
     else:
         raise AssertionError("quest_config has neither default nor default_factory")
+
+
+def test_model_runner_does_not_import_quest_packages_when_disabled():
+    """Touching vllm.v1.worker.gpu.model_runner should not pull in
+    vllm.v1.attention.backends.quest. The bind_runtime call site uses a
+    lazy import gated on quest_config.enabled."""
+    import importlib
+
+    # Make sure quest backend is NOT already loaded by a previous test.
+    for mod in list(sys.modules):
+        if mod.startswith("vllm.v1.attention.backends.quest"):
+            del sys.modules[mod]
+
+    importlib.import_module("vllm.v1.worker.gpu.model_runner")
+
+    leaked = [
+        m for m in sys.modules
+        if m.startswith("vllm.v1.attention.backends.quest")
+    ]
+    assert leaked == [], (
+        f"quest packages leaked into model_runner import: {leaked}"
+    )

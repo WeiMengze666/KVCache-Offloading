@@ -1,0 +1,17 @@
+Phase C async regression baseline.
+- All Phase B + Phase E init tests still pass.
+- Phase C async wiring: QuestStreamPool constructed by bind_runtime when
+  enable_async_prefetch=True; passed by reference to every Quest layer's
+  TierManager. ~130 tests passing.
+- Default path (enable_async_prefetch=False): Phase B sync path
+  unchanged. Async transfer module not imported.
+- Mode 1 (async ensure_resident): non_blocking H2D on h2d_stream;
+  compute_stream waits on the recorded event. _spill_to_cpu uses
+  record_stream + non_blocking D2H on d2h_stream.
+- Mode 2 (cross-layer prefetch): default off (prefetch_window_blocks=0).
+  When enabled, layer N postamble schedules H2D into layer N+1's pool;
+  layer N+1 preamble waits on the recorded event. Carries documented
+  LRU-thrash risk for wrong picks; do not enable in production without
+  measuring cross-layer top-k overlap.
+- Phase F still owed: KV manager block-reuse subscription; prefix
+  caching with Quest still unsupported.

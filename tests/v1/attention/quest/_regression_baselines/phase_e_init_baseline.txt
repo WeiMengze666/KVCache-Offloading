@@ -1,0 +1,11 @@
+Phase E init regression baseline.
+- All Phase B tests still pass (6 test_engine_args.py failures pre-existing,
+  same as Phase B baseline).
+- Phase E init wiring: GPUModelRunner.initialize_kv_cache invokes
+  QuestSparseOffloadBackend.bind_runtime when quest_config.enabled.
+- Default-path zero impact extended to vllm.v1.worker.gpu.model_runner.
+- TierManager now reuses vLLM-allocated KV cache tensor when bind_runtime
+  passes kv_caches; falls back to Phase B fresh-allocation in unit tests.
+- KV-manager block-reuse constraint documented (prefix caching must be off
+  when Quest enabled; Phase F will fix via subscription).
+- Phase E init exit confirmed by Task 7 of this plan.

@@ -13,7 +13,10 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config.cache import CacheDType
@@ -28,6 +31,18 @@ class QuestSparseOffloadBackend(AttentionBackend):
 
     Phase A: identical behavior to FlashAttention.
     Phase B+: real sparse path (see implementation plan / spec).
+
+    .. warning::
+
+       Phase E constraint: this backend's TierManager maintains its own
+       per-layer LRU mapping ``(seq_id, logical_block_id) -> gpu_slot``.
+       vLLM's KVCacheManager separately allocates / evicts / reuses
+       blocks based on its own scheduler logic. **Prefix caching MUST be
+       disabled** when Quest is enabled — otherwise the KV manager may
+       reuse a slot that TierManager still believes is bound to a logical
+       block, producing silent corruption. This will be addressed in
+       Phase F by making TierManager subscribe to KV manager block
+       reclamation events.
     """
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [
@@ -154,6 +169,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
         max_blocks_total: int,
         dtype: torch.dtype,
         quest_config,
+        kv_caches: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Construct the shared BlockSummaryStore + CpuKvBackingStore + per-
         layer TierManager objects, attach a `tier_manager` attribute to each
@@ -175,6 +191,8 @@ class QuestSparseOffloadBackend(AttentionBackend):
             return
 
         full_set = set(quest_config.full_kv_layers)
+        # Filter is also applied by bind_runtime; kept here as defense-in-depth
+        # for direct callers (unit tests).
         quest_layers = [l for l in layers if l.layer_idx not in full_set]
         if not quest_layers:
             return
@@ -204,19 +222,122 @@ class QuestSparseOffloadBackend(AttentionBackend):
             num_layers=num_quest, max_blocks=max_blocks_total,
         )
 
-        # GPU paged buffers: one per layer, sized to the working set.
-        for slot, layer in enumerate(quest_layers):
-            gpu_k = torch.empty(
-                (quest_config.gpu_cache_blocks_per_seq, block_size,
-                 num_kv_heads, head_size),
-                dtype=dtype, device="cuda",
+        # Phase C: optional async transfer infrastructure. None when the
+        # config gate is off — TierManager falls back to Phase B sync path.
+        stream_pool = None
+        if quest_config.enable_async_prefetch:
+            from vllm.v1.attention.backends.quest.async_transfer import (
+                QuestStreamPool,
             )
-            gpu_v = torch.empty_like(gpu_k)
+            stream_pool = QuestStreamPool()
+
+        # GPU paged buffers: prefer vLLM-allocated tensor when supplied
+        # (Phase E hook). Fall back to fresh allocation for unit tests.
+        for slot, layer in enumerate(quest_layers):
+            layer_name = getattr(layer, "layer_name", None)
+            if kv_caches is not None and layer_name in kv_caches:
+                full = kv_caches[layer_name]
+                # FA layout: (num_blocks, 2, block_size, num_kv_heads, head_size)
+                # Zero-copy slice views into the vLLM-allocated tensor.
+                gpu_k = full[:, 0]
+                gpu_v = full[:, 1]
+                gpu_budget = full.shape[0]
+            else:
+                if kv_caches is not None:
+                    logger.warning(
+                        "QuestSparseOffloadBackend: layer %r has "
+                        "layer_name=%r but kv_caches has no entry for it. "
+                        "Falling back to fresh allocation; vLLM-allocated "
+                        "tensor will be unused for this layer.",
+                        layer, layer_name,
+                    )
+                gpu_k = torch.empty(
+                    (quest_config.gpu_cache_blocks_per_seq, block_size,
+                     num_kv_heads, head_size),
+                    dtype=dtype, device="cuda",
+                )
+                gpu_v = torch.empty_like(gpu_k)
+                gpu_budget = quest_config.gpu_cache_blocks_per_seq
             layer.tier_manager = TierManager(
                 layer_idx=slot,
-                gpu_budget=quest_config.gpu_cache_blocks_per_seq,
+                gpu_budget=gpu_budget,
                 gpu_k=gpu_k, gpu_v=gpu_v,
                 summary_store=summary,
                 residency=residency,
                 cpu_store=cpu_store,
+                stream_pool=stream_pool,
             )
+
+        # Mode 2 layer-registry: only when async is on AND prefetch window
+        # is non-zero. Without these refs, run_sparse_decode's helpers
+        # return None and Mode 2 is inert.
+        if (
+            stream_pool is not None
+            and quest_config.prefetch_window_blocks > 0
+        ):
+            tm_registry: dict[int, TierManager] = {
+                l.layer_idx: l.tier_manager
+                for l in quest_layers
+            }
+            indices_view = sorted(tm_registry.keys())
+            for l in quest_layers:
+                l._quest_config_ref = quest_config
+                l._quest_layer_tm_registry = tm_registry
+                l._quest_layer_indices_view = indices_view
+
+    @classmethod
+    def bind_runtime(
+        cls,
+        *,
+        vllm_config,
+        kv_cache_config,
+        kv_caches: dict[str, torch.Tensor],
+        layers: dict[str, object],
+    ) -> None:
+        """Single Phase E entry point called from GPUModelRunner.
+
+        1. No-op when quest_config is disabled.
+        2. Run validate_quest_configuration; raise ValueError on failure.
+        3. Filter layers to those bound to QuestSparseOffloadBackend.
+        4. Compute (block_size, num_kv_heads, head_size, dtype) from the
+           Quest layers' KV cache spec — guaranteed homogeneous because
+           QuestKVCacheSpec.merge enforces equality.
+        5. Call init_runtime_state with the kv_caches dict so each
+           TierManager points into the vLLM-allocated tensor.
+        """
+        quest_config = getattr(vllm_config, "quest_config", None)
+        if quest_config is None or not quest_config.enabled:
+            return
+
+        errors = cls.validate_quest_configuration(
+            model_config=vllm_config.model_config,
+            cache_config=vllm_config.cache_config,
+            quest_config=quest_config,
+        )
+        if errors:
+            raise ValueError(
+                "QuestSparseOffloadBackend configuration is invalid:\n"
+                + "\n".join(f"  - {e}" for e in errors)
+            )
+
+        quest_layers_list = [
+            layer for layer in layers.values()
+            if getattr(layer, "attn_backend", None) is cls
+            and layer.layer_idx not in set(quest_config.full_kv_layers)
+        ]
+        if not quest_layers_list:
+            return
+
+        sample = quest_layers_list[0]
+        block_size = vllm_config.cache_config.block_size
+
+        cls.init_runtime_state(
+            layers=quest_layers_list,
+            block_size=block_size,
+            num_kv_heads=sample.num_kv_heads,
+            head_size=sample.head_size,
+            max_blocks_total=kv_cache_config.num_blocks,
+            dtype=sample.kv_cache_torch_dtype,
+            quest_config=quest_config,
+            kv_caches=kv_caches,
+        )

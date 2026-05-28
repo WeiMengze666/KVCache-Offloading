@@ -79,7 +79,17 @@ class BlockResidency:
     def is_on_gpu_mask(
         self, layer_idx: int, block_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Returns a bool tensor on the same device as block_ids."""
+        """Returns a bool tensor on the same device as block_ids.
+
+        .. warning::
+
+           In Phase C async mode, this mask reflects INTENT, not
+           completion. A block in LOADING (in-flight H2D) state is
+           reported as not-on-GPU, but a block whose state was just
+           set to ON_GPU may still have an in-flight H2D. Callers that
+           consume this mask must serialize with the H2D event from
+           ensure_resident before relying on the result.
+        """
         host_mask = (
             self._states[layer_idx, block_ids.cpu().numpy()]
             == int(ResidencyState.ON_GPU)

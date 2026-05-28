@@ -157,3 +157,29 @@ def test_resolve_cpu_pool_zero_quest_layers_returns_zero():
     assert cfg.resolve_cpu_blocks_per_layer(
         page_size_bytes=1024 * 1024, num_quest_layers=0,
     ) == 0
+
+
+def test_prefetch_window_requires_async_enabled():
+    """Mode 2 (prefetch_window_blocks > 0) requires Mode 1 (async enabled)."""
+    from vllm.config.quest import QuestConfig
+
+    # Async + window > 0: ok (Mode 2).
+    QuestConfig(enabled=True, enable_async_prefetch=True,
+                prefetch_window_blocks=4).validate()
+
+    # Async + window 0: ok (Mode 1).
+    QuestConfig(enabled=True, enable_async_prefetch=True,
+                prefetch_window_blocks=0).validate()
+
+    # Sync + window > 0: rejected.
+    with pytest.raises(ValueError, match="enable_async_prefetch"):
+        QuestConfig(enabled=True, enable_async_prefetch=False,
+                    prefetch_window_blocks=4).validate()
+
+
+def test_prefetch_window_negative_rejected():
+    from vllm.config.quest import QuestConfig
+
+    with pytest.raises(ValueError, match="prefetch_window_blocks"):
+        QuestConfig(enabled=True,
+                    prefetch_window_blocks=-1).validate()
