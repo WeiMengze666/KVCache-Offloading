@@ -254,3 +254,30 @@ class TierManager:
         self.residency.complete_evict(self.layer_idx, logical_block_id)
         self._cpu_slots[(seq_id, logical_block_id)] = cpu_slot
         self._stats.evict_d2h += 1
+
+    def prefetch_top_ids(
+        self,
+        seq_id: int,
+        logical_block_ids: torch.Tensor,
+    ) -> None:
+        """Mode 2: speculatively H2D the given block ids into this layer's
+        pool. Registers an event in the pool keyed by (seq_id, layer_idx).
+
+        No-op when stream_pool is None (sync mode).
+
+        WARNING: this method evicts LRU blocks if the pool is full and the
+        speculation is wrong. See QuestConfig.prefetch_window_blocks
+        docstring for the LRU-thrash analysis.
+        """
+        if self.stream_pool is None:
+            return
+        ids = logical_block_ids.cpu().tolist()
+        with torch.cuda.stream(self.stream_pool.h2d_stream):
+            for bid in ids:
+                self._ensure_one_async(seq_id, bid)
+        event = self.stream_pool.record_h2d_done()
+        self.stream_pool.register_prefetch_event(
+            seq_id=seq_id,
+            target_layer_idx=self.layer_idx,
+            event=event,
+        )
