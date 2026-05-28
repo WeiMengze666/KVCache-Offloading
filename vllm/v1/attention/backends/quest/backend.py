@@ -268,6 +268,23 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 stream_pool=stream_pool,
             )
 
+        # Mode 2 layer-registry: only when async is on AND prefetch window
+        # is non-zero. Without these refs, run_sparse_decode's helpers
+        # return None and Mode 2 is inert.
+        if (
+            stream_pool is not None
+            and quest_config.prefetch_window_blocks > 0
+        ):
+            tm_registry: dict[int, TierManager] = {
+                l.layer_idx: l.tier_manager
+                for l in quest_layers
+            }
+            indices_view = sorted(tm_registry.keys())
+            for l in quest_layers:
+                l._quest_config_ref = quest_config
+                l._quest_layer_tm_registry = tm_registry
+                l._quest_layer_indices_view = indices_view
+
     @classmethod
     def bind_runtime(
         cls,

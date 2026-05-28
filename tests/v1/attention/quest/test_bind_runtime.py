@@ -244,3 +244,85 @@ def test_bind_runtime_no_stream_pool_when_async_disabled(cuda):
         layers=layers_dict,
     )
     assert layers_dict["layer.1"].tier_manager.stream_pool is None
+
+
+def test_bind_runtime_attaches_quest_refs_to_layers(cuda):
+    """For Mode 2: each Quest layer must have _quest_layer_tm_registry,
+    _quest_layer_indices_view, and _quest_config_ref attributes after
+    bind_runtime (when async + window are configured)."""
+    from vllm.config.quest import QuestConfig
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    quest_cfg = QuestConfig(
+        enabled=True, full_kv_layers=[0],
+        gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
+        enable_async_prefetch=True, prefetch_window_blocks=2,
+    )
+    Q = QuestSparseOffloadBackend
+    layers_dict = {
+        "layer.0": _layer(0, "layer.0"),
+        "layer.1": _layer(1, "layer.1", attn_backend=Q),
+        "layer.2": _layer(2, "layer.2", attn_backend=Q),
+    }
+    fake_kv = {
+        f"layer.{i}": torch.empty((8, 2, 256, 2, 64),
+                                   dtype=torch.float16, device="cuda")
+        for i in (1, 2)
+    }
+    QuestSparseOffloadBackend.bind_runtime(
+        vllm_config=_vllm_config(quest_cfg),
+        kv_cache_config=KVCacheConfig(
+            num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
+        ),
+        kv_caches=fake_kv,
+        layers=layers_dict,
+    )
+    for idx in (1, 2):
+        layer = layers_dict[f"layer.{idx}"]
+        assert layer._quest_config_ref is quest_cfg
+        # Registry maps quest layer_idx -> tier_manager.
+        registry = layer._quest_layer_tm_registry
+        assert registry[1] is layers_dict["layer.1"].tier_manager
+        assert registry[2] is layers_dict["layer.2"].tier_manager
+        # Indices view: list of quest layer global indices.
+        view = layer._quest_layer_indices_view
+        assert sorted(view) == [1, 2]
+
+
+def test_bind_runtime_does_not_attach_refs_when_async_disabled(cuda):
+    """When stream_pool is None (sync mode), no Mode 2 refs needed.
+    Don't pollute layer attribute namespace."""
+    from vllm.config.quest import QuestConfig
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    quest_cfg = QuestConfig(
+        enabled=True, full_kv_layers=[0],
+        gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
+        # async off → sync path, no Mode 2 plumbing
+    )
+    Q = QuestSparseOffloadBackend
+    layers_dict = {
+        "layer.0": _layer(0, "layer.0"),
+        "layer.1": _layer(1, "layer.1", attn_backend=Q),
+    }
+    fake_kv = {
+        "layer.1": torch.empty((8, 2, 256, 2, 64),
+                                dtype=torch.float16, device="cuda")
+    }
+    QuestSparseOffloadBackend.bind_runtime(
+        vllm_config=_vllm_config(quest_cfg),
+        kv_cache_config=KVCacheConfig(
+            num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
+        ),
+        kv_caches=fake_kv,
+        layers=layers_dict,
+    )
+    # No refs attached → Mode 2 helpers naturally return None.
+    assert not hasattr(layers_dict["layer.1"], "_quest_config_ref")
+    assert not hasattr(layers_dict["layer.1"], "_quest_layer_tm_registry")
