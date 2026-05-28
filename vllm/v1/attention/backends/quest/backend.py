@@ -98,3 +98,47 @@ class QuestSparseOffloadBackend(AttentionBackend):
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         return attn_type == AttentionType.DECODER
+
+    @classmethod
+    def validate_quest_configuration(
+        cls,
+        *,
+        model_config,
+        cache_config,
+        quest_config,
+    ) -> list[str]:
+        """Return [] when this configuration is acceptable, else a list of
+        human-readable reasons. Phase B helper for unit-testable validation;
+        Phase E will pin this onto the actual selector wiring.
+        """
+        from vllm.v1.attention.backends.quest.compatibility import (
+            check_model_compat,
+        )
+
+        if quest_config is None or not quest_config.enabled:
+            return []
+
+        errors: list[str] = []
+
+        if cache_config.block_size % 256 != 0:
+            errors.append(
+                f"cache_config.block_size={cache_config.block_size} is not a "
+                "multiple of 256. flash_attn paged kernels (FA2/FA3) require "
+                "block_size % 256 == 0. Set --block-size 256 or larger."
+            )
+
+        if quest_config.top_k > quest_config.gpu_cache_blocks_per_seq:
+            errors.append(
+                f"top_k ({quest_config.top_k}) > gpu_cache_blocks_per_seq "
+                f"({quest_config.gpu_cache_blocks_per_seq}); the working set "
+                "must fit the selected blocks."
+            )
+
+        compat = check_model_compat(model_config)
+        if compat:
+            if quest_config.unsupported_model_policy == "error":
+                errors.extend(compat)
+            # else 'fallback': selector will pick the default backend; we
+            # silently refuse this one without surfacing errors.
+
+        return errors
