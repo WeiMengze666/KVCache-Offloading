@@ -148,3 +148,21 @@ def test_logical_to_slot_after_load_changes():
     tm.ensure_resident(seq_id=0, logical_block_ids=ids)
     slot0_now = tm.logical_to_slot(seq_id=0, logical_block_id=0)
     assert 0 <= slot0_now < 2
+
+
+def test_lru_capacity_broader_than_gpu_cache_blocks_per_seq():
+    """When wired by Phase E, capacity = vLLM-allocated num_blocks, which
+    can exceed gpu_cache_blocks_per_seq. _LRUSlotMap should still evict
+    the LRU when full and not silently lose blocks."""
+    from vllm.v1.attention.backends.quest.cache.tier_manager import (
+        _LRUSlotMap,
+    )
+    m = _LRUSlotMap(capacity=12)
+    for i in range(12):
+        slot, evicted = m.add((0, i))
+        assert evicted is None
+        assert 0 <= slot < 12
+    # Add 13th — should evict (0, 0).
+    slot, evicted = m.add((0, 12))
+    assert evicted == (0, 0)
+    assert 0 <= slot < 12

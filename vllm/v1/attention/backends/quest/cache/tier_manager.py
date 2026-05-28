@@ -33,10 +33,17 @@ from vllm.v1.attention.backends.quest.cache.stats import QuestStats
 class _LRUSlotMap:
     """Small per-layer LRU over (seq_id, logical_block_id) -> gpu_slot.
 
+    capacity = the number of GPU slots in this layer's pool. In Phase B
+    that equals `gpu_cache_blocks_per_seq` (one fresh-allocated buffer per
+    Quest layer). In Phase E it equals `kv_cache_config.num_blocks` for
+    the layer's group (the vLLM block_manager-allocated pool). Either
+    way, eviction is invariant: when full, popitem(last=False) removes
+    the LRU key and reuses its slot.
+
     Wraps an OrderedDict so it stays trivial to reason about. We deliberately
-    do NOT pull in vLLM's LRUCachePolicy here in Phase B — that policy is
+    do NOT pull in vLLM's LRUCachePolicy here in Phase B/E — that policy is
     keyed by hashes and carries ref-count machinery we don't need yet. Phase
-    E can swap to LRUCachePolicy if we surface ref-count semantics.
+    F can swap to LRUCachePolicy if we surface ref-count semantics.
     """
 
     def __init__(self, capacity: int) -> None:
