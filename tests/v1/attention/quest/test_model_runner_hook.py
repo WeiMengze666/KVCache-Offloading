@@ -3,8 +3,6 @@
 when quest_config is enabled, and skips it otherwise."""
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import pytest
 import torch
 
@@ -69,8 +67,9 @@ def test_bind_runtime_skipped_when_quest_config_none(monkeypatch):
     from unittest.mock import MagicMock
     import sys
 
-    # Snapshot whether the quest backend module is loaded.
-    pre = "vllm.v1.attention.backends.quest.backend" in sys.modules
+    # Force a clean state: even if a previous test loaded the quest backend,
+    # this test must independently verify the gate prevents import.
+    sys.modules.pop("vllm.v1.attention.backends.quest.backend", None)
 
     from vllm.v1.worker.gpu.model_runner import _invoke_quest_bind_runtime
 
@@ -82,11 +81,10 @@ def test_bind_runtime_skipped_when_quest_config_none(monkeypatch):
         kv_caches={},
         static_forward_context={},
     )
-    # If quest wasn't loaded before, it MUST NOT be loaded after a None config.
-    if not pre:
-        assert (
-            "vllm.v1.attention.backends.quest.backend" not in sys.modules
-        )
+    # Quest backend MUST NOT have been imported.
+    assert (
+        "vllm.v1.attention.backends.quest.backend" not in sys.modules
+    )
 
 
 def test_bind_runtime_skipped_when_quest_config_disabled(monkeypatch):
