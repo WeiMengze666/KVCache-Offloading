@@ -170,3 +170,77 @@ def test_bind_runtime_passes_layers_dict_directly(cuda):
         layers=layers_dict,
     )
     assert layers_dict["layer.1"].tier_manager is not None
+
+
+def test_bind_runtime_constructs_stream_pool_when_async_enabled(cuda):
+    """Mode 1 enabled: tier_managers all share the same QuestStreamPool."""
+    from vllm.config.quest import QuestConfig
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+    from vllm.v1.attention.backends.quest.async_transfer import (
+        QuestStreamPool,
+    )
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    quest_cfg = QuestConfig(
+        enabled=True, full_kv_layers=[0],
+        gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
+        enable_async_prefetch=True,
+    )
+    Q = QuestSparseOffloadBackend
+    layers_dict = {
+        "layer.0": _layer(0, "layer.0"),
+        "layer.1": _layer(1, "layer.1", attn_backend=Q),
+        "layer.2": _layer(2, "layer.2", attn_backend=Q),
+    }
+    fake_kv = {
+        f"layer.{i}": torch.empty((8, 2, 256, 2, 64),
+                                   dtype=torch.float16, device="cuda")
+        for i in (1, 2)
+    }
+    QuestSparseOffloadBackend.bind_runtime(
+        vllm_config=_vllm_config(quest_cfg),
+        kv_cache_config=KVCacheConfig(
+            num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
+        ),
+        kv_caches=fake_kv,
+        layers=layers_dict,
+    )
+    pool1 = layers_dict["layer.1"].tier_manager.stream_pool
+    pool2 = layers_dict["layer.2"].tier_manager.stream_pool
+    assert isinstance(pool1, QuestStreamPool)
+    assert pool1 is pool2  # shared singleton
+
+
+def test_bind_runtime_no_stream_pool_when_async_disabled(cuda):
+    """Default path: stream_pool stays None — Phase B sync behavior intact."""
+    from vllm.config.quest import QuestConfig
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    quest_cfg = QuestConfig(
+        enabled=True, full_kv_layers=[0],
+        gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
+        # enable_async_prefetch defaults to False
+    )
+    Q = QuestSparseOffloadBackend
+    layers_dict = {
+        "layer.0": _layer(0, "layer.0"),
+        "layer.1": _layer(1, "layer.1", attn_backend=Q),
+    }
+    fake_kv = {
+        "layer.1": torch.empty((8, 2, 256, 2, 64),
+                                dtype=torch.float16, device="cuda")
+    }
+    QuestSparseOffloadBackend.bind_runtime(
+        vllm_config=_vllm_config(quest_cfg),
+        kv_cache_config=KVCacheConfig(
+            num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
+        ),
+        kv_caches=fake_kv,
+        layers=layers_dict,
+    )
+    assert layers_dict["layer.1"].tier_manager.stream_pool is None

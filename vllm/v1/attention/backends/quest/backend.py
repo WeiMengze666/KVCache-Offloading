@@ -222,6 +222,15 @@ class QuestSparseOffloadBackend(AttentionBackend):
             num_layers=num_quest, max_blocks=max_blocks_total,
         )
 
+        # Phase C: optional async transfer infrastructure. None when the
+        # config gate is off — TierManager falls back to Phase B sync path.
+        stream_pool = None
+        if quest_config.enable_async_prefetch:
+            from vllm.v1.attention.backends.quest.async_transfer import (
+                QuestStreamPool,
+            )
+            stream_pool = QuestStreamPool()
+
         # GPU paged buffers: prefer vLLM-allocated tensor when supplied
         # (Phase E hook). Fall back to fresh allocation for unit tests.
         for slot, layer in enumerate(quest_layers):
@@ -256,6 +265,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 summary_store=summary,
                 residency=residency,
                 cpu_store=cpu_store,
+                stream_pool=stream_pool,
             )
 
     @classmethod
