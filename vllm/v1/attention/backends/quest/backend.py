@@ -13,7 +13,10 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config.cache import CacheDType
@@ -188,6 +191,8 @@ class QuestSparseOffloadBackend(AttentionBackend):
             return
 
         full_set = set(quest_config.full_kv_layers)
+        # Filter is also applied by bind_runtime; kept here as defense-in-depth
+        # for direct callers (unit tests).
         quest_layers = [l for l in layers if l.layer_idx not in full_set]
         if not quest_layers:
             return
@@ -229,6 +234,14 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 gpu_v = full[:, 1]
                 gpu_budget = full.shape[0]
             else:
+                if kv_caches is not None:
+                    logger.warning(
+                        "QuestSparseOffloadBackend: layer %r has "
+                        "layer_name=%r but kv_caches has no entry for it. "
+                        "Falling back to fresh allocation; vLLM-allocated "
+                        "tensor will be unused for this layer.",
+                        layer, layer_name,
+                    )
                 gpu_k = torch.empty(
                     (quest_config.gpu_cache_blocks_per_seq, block_size,
                      num_kv_heads, head_size),

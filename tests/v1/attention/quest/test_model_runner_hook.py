@@ -59,6 +59,11 @@ def test_bind_runtime_called_when_quest_enabled(cuda, monkeypatch):
         static_forward_context=fake_static_forward_context,
     )
     assert len(call_log) == 1
+    # Verify the static_forward_context arg was forwarded as `layers`.
+    assert call_log[0]["layers"] is fake_static_forward_context
+    assert call_log[0]["kv_caches"] is fake_kv_caches
+    assert call_log[0]["kv_cache_config"] is fake_kv_cache_config
+    assert call_log[0]["vllm_config"] is fake_vllm_config
 
 
 def test_bind_runtime_skipped_when_quest_config_none(monkeypatch):
