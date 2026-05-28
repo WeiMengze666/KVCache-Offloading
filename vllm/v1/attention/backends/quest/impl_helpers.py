@@ -110,7 +110,14 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
             num_kv_groups=layer.num_heads // layer.num_kv_heads,
             top_k=min(top_k, num_blocks),
         )
-        tm.ensure_resident(seq_id=req_idx, logical_block_ids=top_ids)
+        # Wait on H2D completion before kernel reads the slots. Sync mode
+        # returns None (no wait); async mode returns an Event we must
+        # serialize the compute stream against.
+        h2d_event = tm.ensure_resident(
+            seq_id=req_idx, logical_block_ids=top_ids,
+        )
+        if h2d_event is not None:
+            torch.cuda.current_stream().wait_event(h2d_event)
         # Translate logical block ids to physical GPU slots.
         slots = torch.tensor(
             [tm.logical_to_slot(seq_id=req_idx, logical_block_id=int(b))
