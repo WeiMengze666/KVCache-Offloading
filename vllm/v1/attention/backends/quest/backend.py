@@ -28,6 +28,18 @@ class QuestSparseOffloadBackend(AttentionBackend):
 
     Phase A: identical behavior to FlashAttention.
     Phase B+: real sparse path (see implementation plan / spec).
+
+    .. warning::
+
+       Phase E constraint: this backend's TierManager maintains its own
+       per-layer LRU mapping ``(seq_id, logical_block_id) -> gpu_slot``.
+       vLLM's KVCacheManager separately allocates / evicts / reuses
+       blocks based on its own scheduler logic. **Prefix caching MUST be
+       disabled** when Quest is enabled — otherwise the KV manager may
+       reuse a slot that TierManager still believes is bound to a logical
+       block, producing silent corruption. This will be addressed in
+       Phase F by making TierManager subscribe to KV manager block
+       reclamation events.
     """
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [
