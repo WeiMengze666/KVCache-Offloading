@@ -280,7 +280,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
         block_size = vllm_config.cache_config.block_size
 
         cls.init_runtime_state(
-            layers=list(layers.values()),
+            layers=quest_layers_list,
             block_size=block_size,
             num_kv_heads=sample.num_kv_heads,
             head_size=sample.head_size,

@@ -51,15 +51,20 @@ def test_bind_runtime_skips_when_quest_disabled(cuda):
     )
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
+    Q = QuestSparseOffloadBackend
+    layer_a = _layer(1, "layer.1", attn_backend=Q)
+    layer_b = _layer(2, "layer.2", attn_backend=Q)
     QuestSparseOffloadBackend.bind_runtime(
         vllm_config=_vllm_config(QuestConfig(enabled=False)),
         kv_cache_config=KVCacheConfig(
             num_blocks=12, kv_cache_tensors=[], kv_cache_groups=[],
         ),
         kv_caches={},
-        layers={},
+        layers={"layer.1": layer_a, "layer.2": layer_b},
     )
-    # No-op when disabled — nothing raises, nothing crashes.
+    # No-op when disabled — init_runtime_state must not have run.
+    assert getattr(layer_a, "tier_manager", None) is None
+    assert getattr(layer_b, "tier_manager", None) is None
 
 
 def test_bind_runtime_validates_block_size_256(cuda):
@@ -70,6 +75,8 @@ def test_bind_runtime_validates_block_size_256(cuda):
     )
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
+    Q = QuestSparseOffloadBackend
+    layer_a = _layer(1, "layer.1", attn_backend=Q)
     cfg = _vllm_config(QuestConfig(enabled=True))
     cfg.cache_config = SimpleNamespace(block_size=128)  # not multiple of 256
     with pytest.raises(ValueError, match="256"):
@@ -79,8 +86,10 @@ def test_bind_runtime_validates_block_size_256(cuda):
                 num_blocks=12, kv_cache_tensors=[], kv_cache_groups=[],
             ),
             kv_caches={},
-            layers={},
+            layers={"layer.1": layer_a},
         )
+    # Validation must fire before init_runtime_state — no tier_manager attached.
+    assert getattr(layer_a, "tier_manager", None) is None
 
 
 def test_bind_runtime_attaches_tier_manager_using_kv_cache_view(cuda):
@@ -93,7 +102,8 @@ def test_bind_runtime_attaches_tier_manager_using_kv_cache_view(cuda):
 
     quest_cfg = QuestConfig(
         enabled=True, full_kv_layers=[0],
-        top_k=4, gpu_cache_blocks_per_seq=4, cpu_cache_blocks=4,
+        # top_k=4: default top_k=64 would fail validation against gpu_cache_blocks_per_seq=4
+        gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
     )
     Q = QuestSparseOffloadBackend
     layers_dict = {
@@ -150,7 +160,8 @@ def test_bind_runtime_passes_layers_dict_directly(cuda):
     QuestSparseOffloadBackend.bind_runtime(
         vllm_config=_vllm_config(QuestConfig(
             enabled=True, full_kv_layers=[0],
-            top_k=4, gpu_cache_blocks_per_seq=4, cpu_cache_blocks=4,
+            # top_k=4: default top_k=64 would fail validation against gpu_cache_blocks_per_seq=4
+            gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
         )),
         kv_cache_config=KVCacheConfig(
             num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
