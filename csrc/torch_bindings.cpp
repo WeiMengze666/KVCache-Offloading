@@ -77,6 +77,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor? output_scale=None) -> ()");
   ops.impl("merge_attn_states", torch::kCUDA, &merge_attn_states);
 
+  // Quest sparse-attention block-selection score reduction.
+  // Inputs: query [H_kv*G, D], block_summary [B_total, 2, H_kv, D],
+  //         candidate_ids [B] int32. Output: scores [B] fp32.
+  ops.def(
+      "quest_score("
+      "    Tensor query,"
+      "    Tensor block_summary,"
+      "    Tensor candidate_ids,"
+      "    Tensor! scores,"
+      "    int num_kv_groups) -> ()");
+  ops.impl("quest_score", torch::kCUDA, &quest_score);
+
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
   ops.def(
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");

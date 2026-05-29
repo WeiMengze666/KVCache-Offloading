@@ -61,6 +61,10 @@ void merge_attn_states(
     const std::optional<int64_t> prefill_tokens_with_context,
     const std::optional<torch::Tensor>& output_scale = std::nullopt);
 
+void quest_score(const torch::Tensor& query, const torch::Tensor& block_summary,
+                 const torch::Tensor& candidate_ids, torch::Tensor& scores,
+                 int64_t num_kv_groups);
+
 // rms_norm and fused_add_rms_norm declarations also exist in
 // csrc/libtorch_stable/ops.h (torch::stable ABI for CUDA). They remain here
 // because the CPU build still uses these torch::Tensor declarations.

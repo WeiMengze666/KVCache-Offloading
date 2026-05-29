@@ -7,6 +7,7 @@ Forward is delegated to FlashAttentionImpl (see impl.py). Phase B will swap
 the forward implementation in place — this file should not need changes
 beyond updating supports_* flags.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar
@@ -49,7 +50,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
         torch.float16,
         torch.bfloat16,
     ]
-    supported_kv_cache_dtypes: ClassVar[list["CacheDType"]] = [
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
         "bfloat16",
@@ -60,13 +61,13 @@ class QuestSparseOffloadBackend(AttentionBackend):
         return "QUEST_SPARSE_OFFLOAD"
 
     @staticmethod
-    def get_impl_cls() -> type["AttentionImpl"]:
+    def get_impl_cls() -> type[AttentionImpl]:
         from vllm.v1.attention.backends.quest.impl import QuestSparseOffloadImpl
 
         return QuestSparseOffloadImpl
 
     @staticmethod
-    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
+    def get_builder_cls() -> type[AttentionMetadataBuilder]:
         from vllm.v1.attention.backends.quest.metadata import QuestMetadataBuilder
 
         return QuestMetadataBuilder
@@ -186,6 +187,9 @@ class QuestSparseOffloadBackend(AttentionBackend):
         from vllm.v1.attention.backends.quest.cache.tier_manager import (
             TierManager,
         )
+        from vllm.v1.attention.ops.quest_selection_dispatch import (
+            _resolve_selection_callable,
+        )
 
         if not quest_config.enabled:
             return
@@ -197,29 +201,43 @@ class QuestSparseOffloadBackend(AttentionBackend):
         if not quest_layers:
             return
 
+        selection_callable = _resolve_selection_callable(
+            quest_config.selection_impl,
+        )
+
         num_quest = len(quest_layers)
         page_bytes = (
-            2 * block_size * num_kv_heads * head_size
+            2
+            * block_size
+            * num_kv_heads
+            * head_size
             * torch.tensor([], dtype=dtype).element_size()
         )
         cpu_blocks = quest_config.resolve_cpu_blocks_per_layer(
-            page_size_bytes=page_bytes, num_quest_layers=num_quest,
+            page_size_bytes=page_bytes,
+            num_quest_layers=num_quest,
         )
 
         summary = BlockSummaryStore(
             num_layers=num_quest,
             max_blocks=max_blocks_total,
-            block_size=block_size, num_kv_heads=num_kv_heads,
-            head_size=head_size, dtype=dtype, device="cuda",
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+            device="cuda",
         )
         cpu_store = CpuKvBackingStore(
             num_layers=num_quest,
             blocks_per_layer=cpu_blocks,
-            block_size=block_size, num_kv_heads=num_kv_heads,
-            head_size=head_size, dtype=dtype,
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
         )
         residency = BlockResidency(
-            num_layers=num_quest, max_blocks=max_blocks_total,
+            num_layers=num_quest,
+            max_blocks=max_blocks_total,
         )
 
         # Phase C: optional async transfer infrastructure. None when the
@@ -229,6 +247,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
             from vllm.v1.attention.backends.quest.async_transfer import (
                 QuestStreamPool,
             )
+
             stream_pool = QuestStreamPool()
 
         # GPU paged buffers: prefer vLLM-allocated tensor when supplied
@@ -249,35 +268,39 @@ class QuestSparseOffloadBackend(AttentionBackend):
                         "layer_name=%r but kv_caches has no entry for it. "
                         "Falling back to fresh allocation; vLLM-allocated "
                         "tensor will be unused for this layer.",
-                        layer, layer_name,
+                        layer,
+                        layer_name,
                     )
                 gpu_k = torch.empty(
-                    (quest_config.gpu_cache_blocks_per_seq, block_size,
-                     num_kv_heads, head_size),
-                    dtype=dtype, device="cuda",
+                    (
+                        quest_config.gpu_cache_blocks_per_seq,
+                        block_size,
+                        num_kv_heads,
+                        head_size,
+                    ),
+                    dtype=dtype,
+                    device="cuda",
                 )
                 gpu_v = torch.empty_like(gpu_k)
                 gpu_budget = quest_config.gpu_cache_blocks_per_seq
             layer.tier_manager = TierManager(
                 layer_idx=slot,
                 gpu_budget=gpu_budget,
-                gpu_k=gpu_k, gpu_v=gpu_v,
+                gpu_k=gpu_k,
+                gpu_v=gpu_v,
                 summary_store=summary,
                 residency=residency,
                 cpu_store=cpu_store,
                 stream_pool=stream_pool,
             )
+            layer._quest_selection_callable_ref = selection_callable
 
         # Mode 2 layer-registry: only when async is on AND prefetch window
         # is non-zero. Without these refs, run_sparse_decode's helpers
         # return None and Mode 2 is inert.
-        if (
-            stream_pool is not None
-            and quest_config.prefetch_window_blocks > 0
-        ):
+        if stream_pool is not None and quest_config.prefetch_window_blocks > 0:
             tm_registry: dict[int, TierManager] = {
-                l.layer_idx: l.tier_manager
-                for l in quest_layers
+                l.layer_idx: l.tier_manager for l in quest_layers
             }
             indices_view = sorted(tm_registry.keys())
             for l in quest_layers:
@@ -321,7 +344,8 @@ class QuestSparseOffloadBackend(AttentionBackend):
             )
 
         quest_layers_list = [
-            layer for layer in layers.values()
+            layer
+            for layer in layers.values()
             if getattr(layer, "attn_backend", None) is cls
             and layer.layer_idx not in set(quest_config.full_kv_layers)
         ]

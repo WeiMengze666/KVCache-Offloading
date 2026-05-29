@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """bind_runtime: model_runner-side single entry point."""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -15,8 +16,7 @@ def cuda():
         pytest.skip("requires CUDA")
 
 
-def _layer(layer_idx, layer_name, num_kv_heads=2, head_size=64,
-           attn_backend=None):
+def _layer(layer_idx, layer_name, num_kv_heads=2, head_size=64, attn_backend=None):
     return SimpleNamespace(
         layer_idx=layer_idx,
         layer_name=layer_name,
@@ -57,7 +57,9 @@ def test_bind_runtime_skips_when_quest_disabled(cuda):
     QuestSparseOffloadBackend.bind_runtime(
         vllm_config=_vllm_config(QuestConfig(enabled=False)),
         kv_cache_config=KVCacheConfig(
-            num_blocks=12, kv_cache_tensors=[], kv_cache_groups=[],
+            num_blocks=12,
+            kv_cache_tensors=[],
+            kv_cache_groups=[],
         ),
         kv_caches={},
         layers={"layer.1": layer_a, "layer.2": layer_b},
@@ -83,7 +85,9 @@ def test_bind_runtime_validates_block_size_256(cuda):
         QuestSparseOffloadBackend.bind_runtime(
             vllm_config=cfg,
             kv_cache_config=KVCacheConfig(
-                num_blocks=12, kv_cache_tensors=[], kv_cache_groups=[],
+                num_blocks=12,
+                kv_cache_tensors=[],
+                kv_cache_groups=[],
             ),
             kv_caches={},
             layers={"layer.1": layer_a},
@@ -101,28 +105,37 @@ def test_bind_runtime_attaches_tier_manager_using_kv_cache_view(cuda):
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
     quest_cfg = QuestConfig(
-        enabled=True, full_kv_layers=[0],
+        enabled=True,
+        full_kv_layers=[0],
         # top_k=4: default top_k=64 would fail validation against gpu_cache_blocks_per_seq=4
-        gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
+        gpu_cache_blocks_per_seq=4,
+        top_k=4,
+        cpu_cache_blocks=4,
     )
     Q = QuestSparseOffloadBackend
     layers_dict = {
-        "layer.0": _layer(0, "layer.0"),                  # full_kv
+        "layer.0": _layer(0, "layer.0"),  # full_kv
         "layer.1": _layer(1, "layer.1", attn_backend=Q),  # quest
         "layer.2": _layer(2, "layer.2", attn_backend=Q),  # quest
     }
     fake_kv = {
         "layer.1": torch.empty(
-            (12, 2, 256, 2, 64), dtype=torch.float16, device="cuda",
+            (12, 2, 256, 2, 64),
+            dtype=torch.float16,
+            device="cuda",
         ),
         "layer.2": torch.empty(
-            (12, 2, 256, 2, 64), dtype=torch.float16, device="cuda",
+            (12, 2, 256, 2, 64),
+            dtype=torch.float16,
+            device="cuda",
         ),
     }
     QuestSparseOffloadBackend.bind_runtime(
         vllm_config=_vllm_config(quest_cfg),
         kv_cache_config=KVCacheConfig(
-            num_blocks=12, kv_cache_tensors=[], kv_cache_groups=[],
+            num_blocks=12,
+            kv_cache_tensors=[],
+            kv_cache_groups=[],
         ),
         kv_caches=fake_kv,
         layers=layers_dict,
@@ -148,23 +161,27 @@ def test_bind_runtime_passes_layers_dict_directly(cuda):
     Q = QuestSparseOffloadBackend
     layers_dict = {
         "layer.0": _layer(0, "layer.0"),
-        **{f"layer.{i}": _layer(i, f"layer.{i}", attn_backend=Q)
-           for i in (1, 2)},
+        **{f"layer.{i}": _layer(i, f"layer.{i}", attn_backend=Q) for i in (1, 2)},
     }
     fake_kv = {
-        "layer.1": torch.empty((8, 2, 256, 2, 64),
-                               dtype=torch.float16, device="cuda"),
-        "layer.2": torch.empty((8, 2, 256, 2, 64),
-                               dtype=torch.float16, device="cuda"),
+        "layer.1": torch.empty((8, 2, 256, 2, 64), dtype=torch.float16, device="cuda"),
+        "layer.2": torch.empty((8, 2, 256, 2, 64), dtype=torch.float16, device="cuda"),
     }
     QuestSparseOffloadBackend.bind_runtime(
-        vllm_config=_vllm_config(QuestConfig(
-            enabled=True, full_kv_layers=[0],
-            # top_k=4: default top_k=64 would fail validation against gpu_cache_blocks_per_seq=4
-            gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
-        )),
+        vllm_config=_vllm_config(
+            QuestConfig(
+                enabled=True,
+                full_kv_layers=[0],
+                # top_k=4: default top_k=64 would fail validation against gpu_cache_blocks_per_seq=4
+                gpu_cache_blocks_per_seq=4,
+                top_k=4,
+                cpu_cache_blocks=4,
+            )
+        ),
         kv_cache_config=KVCacheConfig(
-            num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[],
         ),
         kv_caches=fake_kv,
         layers=layers_dict,
@@ -175,17 +192,20 @@ def test_bind_runtime_passes_layers_dict_directly(cuda):
 def test_bind_runtime_constructs_stream_pool_when_async_enabled(cuda):
     """Mode 1 enabled: tier_managers all share the same QuestStreamPool."""
     from vllm.config.quest import QuestConfig
-    from vllm.v1.attention.backends.quest.backend import (
-        QuestSparseOffloadBackend,
-    )
     from vllm.v1.attention.backends.quest.async_transfer import (
         QuestStreamPool,
+    )
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
     )
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
     quest_cfg = QuestConfig(
-        enabled=True, full_kv_layers=[0],
-        gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
+        enabled=True,
+        full_kv_layers=[0],
+        gpu_cache_blocks_per_seq=4,
+        top_k=4,
+        cpu_cache_blocks=4,
         enable_async_prefetch=True,
     )
     Q = QuestSparseOffloadBackend
@@ -195,14 +215,17 @@ def test_bind_runtime_constructs_stream_pool_when_async_enabled(cuda):
         "layer.2": _layer(2, "layer.2", attn_backend=Q),
     }
     fake_kv = {
-        f"layer.{i}": torch.empty((8, 2, 256, 2, 64),
-                                   dtype=torch.float16, device="cuda")
+        f"layer.{i}": torch.empty(
+            (8, 2, 256, 2, 64), dtype=torch.float16, device="cuda"
+        )
         for i in (1, 2)
     }
     QuestSparseOffloadBackend.bind_runtime(
         vllm_config=_vllm_config(quest_cfg),
         kv_cache_config=KVCacheConfig(
-            num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[],
         ),
         kv_caches=fake_kv,
         layers=layers_dict,
@@ -222,8 +245,11 @@ def test_bind_runtime_no_stream_pool_when_async_disabled(cuda):
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
     quest_cfg = QuestConfig(
-        enabled=True, full_kv_layers=[0],
-        gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
+        enabled=True,
+        full_kv_layers=[0],
+        gpu_cache_blocks_per_seq=4,
+        top_k=4,
+        cpu_cache_blocks=4,
         # enable_async_prefetch defaults to False
     )
     Q = QuestSparseOffloadBackend
@@ -232,13 +258,14 @@ def test_bind_runtime_no_stream_pool_when_async_disabled(cuda):
         "layer.1": _layer(1, "layer.1", attn_backend=Q),
     }
     fake_kv = {
-        "layer.1": torch.empty((8, 2, 256, 2, 64),
-                                dtype=torch.float16, device="cuda")
+        "layer.1": torch.empty((8, 2, 256, 2, 64), dtype=torch.float16, device="cuda")
     }
     QuestSparseOffloadBackend.bind_runtime(
         vllm_config=_vllm_config(quest_cfg),
         kv_cache_config=KVCacheConfig(
-            num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[],
         ),
         kv_caches=fake_kv,
         layers=layers_dict,
@@ -257,9 +284,13 @@ def test_bind_runtime_attaches_quest_refs_to_layers(cuda):
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
     quest_cfg = QuestConfig(
-        enabled=True, full_kv_layers=[0],
-        gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
-        enable_async_prefetch=True, prefetch_window_blocks=2,
+        enabled=True,
+        full_kv_layers=[0],
+        gpu_cache_blocks_per_seq=4,
+        top_k=4,
+        cpu_cache_blocks=4,
+        enable_async_prefetch=True,
+        prefetch_window_blocks=2,
     )
     Q = QuestSparseOffloadBackend
     layers_dict = {
@@ -268,14 +299,17 @@ def test_bind_runtime_attaches_quest_refs_to_layers(cuda):
         "layer.2": _layer(2, "layer.2", attn_backend=Q),
     }
     fake_kv = {
-        f"layer.{i}": torch.empty((8, 2, 256, 2, 64),
-                                   dtype=torch.float16, device="cuda")
+        f"layer.{i}": torch.empty(
+            (8, 2, 256, 2, 64), dtype=torch.float16, device="cuda"
+        )
         for i in (1, 2)
     }
     QuestSparseOffloadBackend.bind_runtime(
         vllm_config=_vllm_config(quest_cfg),
         kv_cache_config=KVCacheConfig(
-            num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[],
         ),
         kv_caches=fake_kv,
         layers=layers_dict,
@@ -302,8 +336,11 @@ def test_bind_runtime_does_not_attach_refs_when_async_disabled(cuda):
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
     quest_cfg = QuestConfig(
-        enabled=True, full_kv_layers=[0],
-        gpu_cache_blocks_per_seq=4, top_k=4, cpu_cache_blocks=4,
+        enabled=True,
+        full_kv_layers=[0],
+        gpu_cache_blocks_per_seq=4,
+        top_k=4,
+        cpu_cache_blocks=4,
         # async off → sync path, no Mode 2 plumbing
     )
     Q = QuestSparseOffloadBackend
@@ -312,13 +349,14 @@ def test_bind_runtime_does_not_attach_refs_when_async_disabled(cuda):
         "layer.1": _layer(1, "layer.1", attn_backend=Q),
     }
     fake_kv = {
-        "layer.1": torch.empty((8, 2, 256, 2, 64),
-                                dtype=torch.float16, device="cuda")
+        "layer.1": torch.empty((8, 2, 256, 2, 64), dtype=torch.float16, device="cuda")
     }
     QuestSparseOffloadBackend.bind_runtime(
         vllm_config=_vllm_config(quest_cfg),
         kv_cache_config=KVCacheConfig(
-            num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[],
         ),
         kv_caches=fake_kv,
         layers=layers_dict,
@@ -326,3 +364,90 @@ def test_bind_runtime_does_not_attach_refs_when_async_disabled(cuda):
     # No refs attached → Mode 2 helpers naturally return None.
     assert not hasattr(layers_dict["layer.1"], "_quest_config_ref")
     assert not hasattr(layers_dict["layer.1"], "_quest_layer_tm_registry")
+
+
+def test_bind_runtime_stashes_selection_callable_torch():
+    """init_runtime_state pre-resolves selection_impl=='torch' and stashes
+    the callable on each Quest layer as `_quest_selection_callable_ref`."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    from vllm.config.quest import QuestConfig
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+    from vllm.v1.attention.ops.quest_selection_torch import (
+        quest_selection_torch,
+    )
+
+    quest_cfg = QuestConfig(
+        enabled=True,
+        block_size=256,
+        top_k=4,
+        gpu_cache_blocks_per_seq=8,
+        full_kv_layers=[],
+        selection_impl="torch",
+    )
+    layer = SimpleNamespace(
+        layer_idx=2,
+        num_kv_heads=4,
+        head_size=128,
+        num_heads=8,
+        layer_name="quest.0",
+    )
+    QuestSparseOffloadBackend.init_runtime_state(
+        layers=[layer],
+        block_size=256,
+        num_kv_heads=4,
+        head_size=128,
+        max_blocks_total=16,
+        dtype=torch.float16,
+        quest_config=quest_cfg,
+        kv_caches=None,
+    )
+    assert getattr(layer, "_quest_selection_callable_ref", None) is (
+        quest_selection_torch
+    )
+
+
+def test_bind_runtime_stashes_selection_callable_triton():
+    """Same as above but for selection_impl=='triton'."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    from vllm.config.quest import QuestConfig
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+    from vllm.v1.attention.ops.quest_selection_triton import (
+        quest_selection_triton,
+    )
+
+    quest_cfg = QuestConfig(
+        enabled=True,
+        block_size=256,
+        top_k=4,
+        gpu_cache_blocks_per_seq=8,
+        full_kv_layers=[],
+        selection_impl="triton",
+    )
+    layer = SimpleNamespace(
+        layer_idx=2,
+        num_kv_heads=4,
+        head_size=128,
+        num_heads=8,
+        layer_name="quest.0",
+    )
+    QuestSparseOffloadBackend.init_runtime_state(
+        layers=[layer],
+        block_size=256,
+        num_kv_heads=4,
+        head_size=128,
+        max_blocks_total=16,
+        dtype=torch.float16,
+        quest_config=quest_cfg,
+        kv_caches=None,
+    )
+    assert getattr(layer, "_quest_selection_callable_ref", None) is (
+        quest_selection_triton
+    )
