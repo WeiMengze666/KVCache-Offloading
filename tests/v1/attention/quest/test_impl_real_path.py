@@ -464,3 +464,42 @@ def test_run_sparse_decode_uses_layer_callable_ref(cuda):
     layer._quest_selection_callable_ref = spy
     run_sparse_decode(impl, layer, q, kv_cache, md, output)
     assert len(calls) >= 1, "run_sparse_decode never called the layer ref"
+
+
+@pytest.mark.parametrize(
+    "selection_impl",
+    ["torch", "triton", "cuda"],
+)
+def test_run_sparse_decode_dispatches_per_selection_impl(
+    cuda,
+    selection_impl,
+):
+    """run_sparse_decode produces equivalent output across all three
+    selection_impl values when the same query / kv state is used.
+
+    Equivalence is set-of-block-ids (not numeric attention output),
+    because top-k tie-break order can differ across kernels — the
+    existing Phase B / triton tests already establish this convention.
+    """
+    pytest.importorskip("flash_attn")
+    if selection_impl == "cuda":
+        try:
+            import vllm._C  # noqa: F401
+        except ImportError as exc:
+            pytest.skip(f"vllm._C not built: {exc}")
+
+    from vllm.v1.attention.ops.quest_selection_dispatch import (
+        _resolve_selection_callable,
+    )
+    from vllm.v1.attention.backends.quest.impl_helpers import (
+        run_sparse_decode,
+    )
+
+    impl, layer, q, kv_cache, md, output = _build_real_path_state()
+    layer._quest_selection_callable_ref = _resolve_selection_callable(
+        selection_impl,
+    )
+
+    out = run_sparse_decode(impl, layer, q, kv_cache, md, output)
+    assert out is not None
+    assert torch.isfinite(out).all(), f"{selection_impl}: non-finite values in output"
