@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Default vLLM path is not affected by Quest backend code being on disk."""
+
 from __future__ import annotations
 
 import sys
@@ -23,9 +25,7 @@ def test_quest_packages_not_imported_by_vllm_attention_module():
         import vllm.v1.attention.backends.registry  # noqa: F401
 
         bad = [
-            m
-            for m in sys.modules
-            if m.startswith("vllm.v1.attention.backends.quest")
+            m for m in sys.modules if m.startswith("vllm.v1.attention.backends.quest")
         ]
         assert bad == [], (
             f"Quest packages were eagerly imported by vLLM core: {bad}. "
@@ -69,9 +69,33 @@ def test_model_runner_does_not_import_quest_packages_when_disabled():
     importlib.import_module("vllm.v1.worker.gpu.model_runner")
 
     leaked = [
-        m for m in sys.modules
-        if m.startswith("vllm.v1.attention.backends.quest")
+        m for m in sys.modules if m.startswith("vllm.v1.attention.backends.quest")
     ]
-    assert leaked == [], (
-        f"quest packages leaked into model_runner import: {leaked}"
+    assert leaked == [], f"quest packages leaked into model_runner import: {leaked}"
+
+
+def test_default_path_does_not_import_phase_d_modules():
+    """Phase D adds quest_selection_dispatch + quest_selection_cuda. They
+    must NOT be imported on the default path (quest_config disabled)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "import vllm.v1.attention\n"
+        "import vllm.v1.worker.gpu.model_runner\n"
+        "leaked = [m for m in sys.modules "
+        "if 'quest_selection_dispatch' in m "
+        "or 'quest_selection_cuda' in m]\n"
+        "assert not leaked, 'Phase D modules leaked on default path: ' "
+        "+ str(leaked)\n"
+        "print('OK')\n"
     )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert "OK" in result.stdout
