@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-step orchestration for QuestSparseOffloadImpl."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -17,7 +18,7 @@ def notify_filled_blocks_after_prefill(layer, key, value, md) -> None:
     """Called right after FA's prefill writes KV. Walks slot_mapping to
     detect block boundaries; for each boundary crossed, hands the just-
     completed K/V block to the layer's TierManager."""
-    tm: "TierManager | None" = getattr(layer, "tier_manager", None)
+    tm: TierManager | None = getattr(layer, "tier_manager", None)
     if tm is None:
         return
     # In Phase B, prefill is single-shot per request and slot_mapping is
@@ -53,7 +54,7 @@ def notify_filled_blocks_after_decode(layer, kv_cache, md) -> None:
     `reshape_and_cache_flash`, so we read the full block back from the
     physical slot rather than from the 1-token `key`/`value` tensors.
     """
-    tm: "TierManager | None" = getattr(layer, "tier_manager", None)
+    tm: TierManager | None = getattr(layer, "tier_manager", None)
     if tm is None:
         return
     block_size = tm.gpu_k.shape[1]
@@ -114,11 +115,18 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     """Decode-step sparse path. Must equal dense FA when top_k >= num_blocks
     and no eviction has happened (proved by R1 spike)."""
     from flash_attn import flash_attn_with_kvcache
-    from vllm.v1.attention.ops.quest_selection_torch import (
-        quest_selection_torch,
-    )
 
-    tm: "TierManager" = layer.tier_manager
+    selection_fn = getattr(layer, "_quest_selection_callable_ref", None)
+    if selection_fn is None:
+        # Unit-test fallback: tests that bypass bind_runtime don't stash
+        # a ref; default to the torch oracle (the Phase B baseline).
+        from vllm.v1.attention.ops.quest_selection_torch import (
+            quest_selection_torch,
+        )
+
+        selection_fn = quest_selection_torch
+
+    tm: TierManager = layer.tier_manager
     seq_lens = md.seq_lens
     block_size = tm.gpu_k.shape[1]
     num_reqs = seq_lens.shape[0]
@@ -132,7 +140,8 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     if pool is not None:
         for req_idx in range(num_reqs):
             prefetch_event = pool.pop_prefetch_event(
-                seq_id=req_idx, target_layer_idx=layer.layer_idx,
+                seq_id=req_idx,
+                target_layer_idx=layer.layer_idx,
             )
             if prefetch_event is not None:
                 torch.cuda.current_stream().wait_event(prefetch_event)
@@ -142,13 +151,12 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     for req_idx in range(num_reqs):
         sl = int(seq_lens[req_idx].item())
         num_blocks = (sl + block_size - 1) // block_size
-        cand = torch.arange(num_blocks, dtype=torch.int32,
-                            device=query.device)
+        cand = torch.arange(num_blocks, dtype=torch.int32, device=query.device)
         # build [num_kv_heads * G, head_size] view for the last query token
-        q_token = query[req_idx]              # [num_heads, head_size]
+        q_token = query[req_idx]  # [num_heads, head_size]
         # Score using the global summary row.
         summary_layer = tm.summary_store.summary[layer.layer_idx]
-        top_ids = quest_selection_torch(
+        top_ids = selection_fn(
             query=q_token.reshape(layer.num_heads, layer.head_size),
             block_summary=summary_layer,
             candidate_ids=cand,
@@ -160,27 +168,35 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         # returns None (no wait); async mode returns an Event we must
         # serialize the compute stream against.
         h2d_event = tm.ensure_resident(
-            seq_id=req_idx, logical_block_ids=top_ids,
+            seq_id=req_idx,
+            logical_block_ids=top_ids,
         )
         if h2d_event is not None:
             torch.cuda.current_stream().wait_event(h2d_event)
         # Translate logical block ids to physical GPU slots.
         slots = torch.tensor(
-            [tm.logical_to_slot(seq_id=req_idx, logical_block_id=int(b))
-             for b in top_ids.tolist()],
-            dtype=torch.int32, device=query.device,
+            [
+                tm.logical_to_slot(seq_id=req_idx, logical_block_id=int(b))
+                for b in top_ids.tolist()
+            ],
+            dtype=torch.int32,
+            device=query.device,
         ).unsqueeze(0)
         sub_seq_len = torch.tensor(
             [slots.numel() * block_size],
-            dtype=torch.int32, device=query.device,
+            dtype=torch.int32,
+            device=query.device,
         )
         # kv_cache layout (num_blocks, 2, block_size, h_kv, head_size)
         k_view = kv_cache[:, 0]
         v_view = kv_cache[:, 1]
         out_req = flash_attn_with_kvcache(
-            query[req_idx: req_idx + 1].unsqueeze(1),
-            k_view, v_view,
-            block_table=slots, cache_seqlens=sub_seq_len, causal=True,
+            query[req_idx : req_idx + 1].unsqueeze(1),
+            k_view,
+            v_view,
+            block_table=slots,
+            cache_seqlens=sub_seq_len,
+            causal=True,
         )
         out_chunks.append(out_req.squeeze(1))
 
@@ -200,7 +216,7 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
                     for req_idx, top_ids in enumerate(per_req_top_ids):
                         # Limit how many ids we prefetch to bound the
                         # LRU-thrash exposure (see QuestConfig docstring).
-                        ids = top_ids[: window]
+                        ids = top_ids[:window]
                         next_tm.prefetch_top_ids(
                             seq_id=req_idx,
                             logical_block_ids=ids,
