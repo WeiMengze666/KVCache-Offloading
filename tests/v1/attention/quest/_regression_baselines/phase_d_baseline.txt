@@ -1,0 +1,38 @@
+# Phase D regression baseline — feat/quest-phase-d HEAD 3da6f6cd7
+# Recorded by: Task 10
+# Run from: /home/yijun/offload_attn/KVCache-Offloading/
+
+# venv (uv venv --python 3.12, torch 2.11.0+cu129, vllm._C built fresh)
+.venv/bin/python -m pytest tests/v1/attention/quest/ \
+    --ignore=tests/v1/attention/quest/test_alignment_vllm_dense_fa.py \
+    --ignore=tests/v1/attention/quest/spike_sparse_block_table.py \
+    --ignore=tests/v1/attention/quest/test_engine_args.py
+=> 160 passed, 1 skipped, 16 warnings in 110.24s
+
+# conda env (/home/yijun/anaconda3/envs/offload, torch 2.9.1+cu128)
+# Status: ABANDONED for Phase D onward.
+#
+# When Phase D rebuilt vllm/_C.abi3.so against the venv's torch 2.11.0+cu129,
+# the binary became ABI-incompatible with conda env's torch 2.9.1+cu128. The
+# error surfaces at conda env pytest collection because tests/conftest.py:45
+# imports vllm.config, which imports vllm.platforms.cuda, which hard-imports
+# vllm._C at module top:
+#   ImportError: vllm/_C.abi3.so: undefined symbol:
+#   _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_jb
+#
+# All Phase D tests run in the venv. Conda env is no longer the test path.
+# A future task may rebuild _C in conda env separately, but that's beyond
+# Phase D scope.
+
+# Phase D commit range:
+# git log --oneline feat/quest-phase-c..feat/quest-phase-d
+3da6f6cd7 test(quest): default path stays clean of Phase D modules
+aea0edb06 test(quest): run_sparse_decode honors selection_impl end-to-end
+4773c8849 test(quest): cuda kernel parity vs torch oracle (fp16+bf16)
+94722b0b6 feat(quest): real CUDA selection wrapper
+e8372820c feat(quest): add CUDA quest_score kernel + _C op binding
+100a33e45 feat(quest): bind_runtime pre-resolves selection callable
+cf8903661 feat(quest): add selection_impl dispatcher (torch/triton/cuda)
+b511b348b test(quest): parametrize triton kernel on fp16+bf16
+1aad081ae test(quest): parametrize torch oracle on fp16+bf16
+4670a3efb chore(quest): start Phase D branch from feat/quest-phase-c
