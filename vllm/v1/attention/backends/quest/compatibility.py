@@ -5,6 +5,7 @@
 This is the **only** place that contains model-family branching. Other files
 in `backends/quest/` MUST stay model-agnostic.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -24,11 +25,13 @@ def check_model_compat(model_config: Any) -> list[str]:
 
     architecture = getattr(model_config, "architecture", None)
     if architecture is None:
-        errors.append(
-            "Quest requires model_config.architecture to be set; got None"
-        )
+        errors.append("Quest requires model_config.architecture to be set; got None")
     else:
-        normalized = str(architecture).lower()
+        # vLLM's `model_config.architecture` is the HF class name
+        # (e.g. "LlamaForCausalLM"), but the whitelist tracks family
+        # identifiers ("llama"). Strip the "ForCausalLM" suffix before
+        # matching.
+        normalized = str(architecture).lower().removesuffix("forcausallm")
         if normalized not in SUPPORTED_MODEL_FAMILIES:
             errors.append(
                 f"Quest does not yet support architecture {architecture!r}. "

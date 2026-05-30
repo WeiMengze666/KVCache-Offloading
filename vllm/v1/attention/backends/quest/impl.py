@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """QuestSparseOffloadImpl — Phase B real forward path."""
+
 from __future__ import annotations
 
 import torch
@@ -67,13 +68,49 @@ class QuestSparseOffloadImpl(AttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if attn_metadata is None:
+            # Dummy forward (profiling / capture warmup). Delegate to FA which
+            # also no-ops on None metadata. Quest sparse path requires real
+            # metadata + a populated tier_manager state, neither of which
+            # exists during the profiling pass.
+            return self._fa_impl.forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale=output_scale,
+                output_block_scale=output_block_scale,
+            )
         is_prefill = attn_metadata.max_query_len > 1
-        if is_prefill or self._is_full_kv_layer(layer, attn_metadata):
+        full_kv = self._is_full_kv_layer(layer, attn_metadata)
+        # Quest sparse decode needs at least one fully-filled block per seq
+        # (block_size tokens registered to tier_manager). If any seq in the
+        # batch is still inside its first block, candidates would include an
+        # unfilled block and tier_manager.ensure_resident would fail. Fall
+        # back to dense for the whole batch in that case.
+        block_size = (
+            layer.tier_manager.gpu_k.shape[1]
+            if getattr(layer, "tier_manager", None) is not None
+            else 0
+        )
+        any_seq_too_short = block_size > 0 and bool(
+            (attn_metadata.seq_lens < block_size).any().item()
+        )
+        if is_prefill or full_kv or any_seq_too_short:
             # Prefill always runs full attention (spec §1). Full-KV layers
             # always delegate, regardless of phase. Both share the standard
             # FA forward — including reshape_and_cache_flash for KV write.
             out = self._fa_impl.forward(
-                layer, query, key, value, kv_cache, attn_metadata, output,
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
                 output_scale=output_scale,
                 output_block_scale=output_block_scale,
             )
@@ -81,20 +118,33 @@ class QuestSparseOffloadImpl(AttentionImpl):
             # so the working set + summaries are up to date for the upcoming
             # decode steps.
             self._notify_filled_blocks_after_prefill(
-                layer, key, value, attn_metadata,
+                layer,
+                key,
+                value,
+                attn_metadata,
             )
             return out
 
         # Decode of a Quest layer: write KV first via the standard helper,
         # then run the sparse path.
         self._write_kv_via_fa_helper(
-            layer, key, value, kv_cache, attn_metadata,
+            layer,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
         )
         self._notify_filled_blocks_after_decode(
-            layer, kv_cache, attn_metadata,
+            layer,
+            kv_cache,
+            attn_metadata,
         )
         return self._forward_sparse_decode(
-            layer, query, kv_cache, attn_metadata, output,
+            layer,
+            query,
+            kv_cache,
+            attn_metadata,
+            output,
         )
 
     # ----- private helpers (see Task 14 for full bodies) -----
@@ -107,13 +157,17 @@ class QuestSparseOffloadImpl(AttentionImpl):
 
     def _write_kv_via_fa_helper(self, layer, key, value, kv_cache, md):
         from vllm._custom_ops import reshape_and_cache_flash
+
         n = md.num_actual_tokens
         reshape_and_cache_flash(
-            key[:n], value[:n],
-            kv_cache[:, 0], kv_cache[:, 1],
+            key[:n],
+            value[:n],
+            kv_cache[:, 0],
+            kv_cache[:, 1],
             md.slot_mapping[:n],
             self.kv_cache_dtype,
-            layer._k_scale, layer._v_scale,
+            layer._k_scale,
+            layer._v_scale,
         )
 
     def _notify_filled_blocks_after_prefill(self, layer, key, value, md):
@@ -121,16 +175,19 @@ class QuestSparseOffloadImpl(AttentionImpl):
         from vllm.v1.attention.backends.quest.impl_helpers import (
             notify_filled_blocks_after_prefill,
         )
+
         notify_filled_blocks_after_prefill(layer, key, value, md)
 
     def _notify_filled_blocks_after_decode(self, layer, kv_cache, md):
         from vllm.v1.attention.backends.quest.impl_helpers import (
             notify_filled_blocks_after_decode,
         )
+
         notify_filled_blocks_after_decode(layer, kv_cache, md)
 
     def _forward_sparse_decode(self, layer, query, kv_cache, md, output):
         from vllm.v1.attention.backends.quest.impl_helpers import (
             run_sparse_decode,
         )
+
         return run_sparse_decode(self, layer, query, kv_cache, md, output)

@@ -116,6 +116,13 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     and no eviction has happened (proved by R1 spike)."""
     from flash_attn import flash_attn_with_kvcache
 
+    # Increment stats up-front so the counter reflects "sparse path engaged"
+    # even when num_blocks=0 makes the inner loop a no-op. selected_total is
+    # accumulated below as we loop over requests.
+    tm_stats: TierManager | None = getattr(layer, "tier_manager", None)
+    if tm_stats is not None:
+        tm_stats._stats.select_calls += 1
+
     selection_fn = getattr(layer, "_quest_selection_callable_ref", None)
     if selection_fn is None:
         # Unit-test fallback: tests that bypass bind_runtime don't stash
@@ -150,12 +157,20 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     out_chunks = []
     for req_idx in range(num_reqs):
         sl = int(seq_lens[req_idx].item())
-        num_blocks = (sl + block_size - 1) // block_size
+        # Quest can only score *fully filled* blocks (the trailing partial
+        # block has no entry in tier_manager yet — only `on_block_filled`
+        # registers a block, and that fires on block boundaries). Use floor
+        # division so the trailing partial block is treated as buffer that
+        # the caller's seq_too_short gate handles.
+        num_blocks = sl // block_size
         cand = torch.arange(num_blocks, dtype=torch.int32, device=query.device)
         # build [num_kv_heads * G, head_size] view for the last query token
         q_token = query[req_idx]  # [num_heads, head_size]
-        # Score using the global summary row.
-        summary_layer = tm.summary_store.summary[layer.layer_idx]
+        # Score using the per-layer summary row. tm.layer_idx is the quest
+        # slot (0..num_quest_layers-1), NOT the global layer_idx —
+        # summary_store is sized num_quest_layers, so indexing by global
+        # layer_idx (2..27) overflows.
+        summary_layer = tm.summary_store.summary[tm.layer_idx]
         top_ids = selection_fn(
             query=q_token.reshape(layer.num_heads, layer.head_size),
             block_summary=summary_layer,
@@ -164,6 +179,8 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
             top_k=min(top_k, num_blocks),
         )
         per_req_top_ids.append(top_ids)
+        if tm_stats is not None:
+            tm_stats._stats.selected_total += int(top_ids.numel())
         # Wait on H2D completion before kernel reads the slots. Sync mode
         # returns None (no wait); async mode returns an Event we must
         # serialize the compute stream against.

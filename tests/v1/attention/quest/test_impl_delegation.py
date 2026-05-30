@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Verify QuestSparseOffloadImpl delegates forward to FlashAttentionImpl."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -11,7 +13,7 @@ def _impl_kwargs():
     return dict(
         num_heads=8,
         head_size=64,
-        scale=1.0 / (64 ** 0.5),
+        scale=1.0 / (64**0.5),
         num_kv_heads=8,
         alibi_slopes=None,
         sliding_window=None,
@@ -46,6 +48,10 @@ def test_forward_passes_through_to_fa_forward():
 
         impl = QuestSparseOffloadImpl(**_impl_kwargs())
         layer = MagicMock()
+        # Prevent MagicMock auto-attrs from poisoning Quest's _is_full_kv_layer
+        # check (which now reads attn_metadata.quest_layer_indices) and the
+        # seq_too_short gate (which reads layer.tier_manager).
+        layer.tier_manager = None
         q = torch.zeros(2, 8, 64)
         k = torch.zeros(2, 8, 64)
         v = torch.zeros(2, 8, 64)
@@ -54,6 +60,8 @@ def test_forward_passes_through_to_fa_forward():
         # to FlashAttentionImpl.forward (spec §1: prefill is full attention).
         meta = MagicMock()
         meta.max_query_len = 4
+        meta.quest_layer_indices = None
+        meta.seq_lens = torch.tensor([4])
         out = torch.zeros(2, 8, 64)
 
         result = impl.forward(layer, q, k, v, kv_cache, meta, out)

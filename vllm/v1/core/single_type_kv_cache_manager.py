@@ -1211,12 +1211,29 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
 }
 
 
+def _register_quest_kv_cache_spec() -> None:
+    """Bind QuestKVCacheSpec to FullAttentionManager.
+
+    QuestKVCacheSpec is paged-attention compatible at the manager level;
+    its working-set sizing and CPU spill semantics are handled inside
+    QuestSparseOffloadBackend, not here. Lazy import keeps the default
+    path's import graph free of quest modules.
+    """
+    from vllm.v1.kv_cache_interface import QuestKVCacheSpec
+
+    spec_manager_map.setdefault(QuestKVCacheSpec, FullAttentionManager)
+
+
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec,
     max_num_batched_tokens: int,
     max_model_len: int,
     **kwargs,
 ) -> SingleTypeKVCacheManager:
+    if type(kv_cache_spec).__name__ == "QuestKVCacheSpec":
+        # Lazy bind on first request; the gate keeps the default-path
+        # import graph free of quest modules until Quest is actually in use.
+        _register_quest_kv_cache_spec()
     manager_class = spec_manager_map[type(kv_cache_spec)]
     # SlidingWindow / ChunkedLocalAttention managers recycle blocks across
     # chunks; the runtime admission cap must match the recycling-aware bound

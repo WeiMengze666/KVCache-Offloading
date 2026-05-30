@@ -248,10 +248,12 @@ class Attention(nn.Module, AttentionLayerBase):
             and kv_cache_scheme.get("strategy") == "attn_head"
         )
 
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        self.layer_idx = extract_layer_index(prefix)
+
         # Skip quantization for specified layers
         if cache_config is not None and cache_config.kv_cache_dtype_skip_layers:
-            from vllm.model_executor.models.utils import extract_layer_index
-
             skip = False
             # Check attention type
             if (
@@ -260,8 +262,7 @@ class Attention(nn.Module, AttentionLayerBase):
             ):
                 skip = True
             # Check layer index
-            layer_idx = extract_layer_index(prefix)
-            if str(layer_idx) in cache_config.kv_cache_dtype_skip_layers:
+            if str(self.layer_idx) in cache_config.kv_cache_dtype_skip_layers:
                 skip = True
             if skip:
                 kv_cache_dtype = "auto"

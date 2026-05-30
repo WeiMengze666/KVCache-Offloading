@@ -2285,6 +2285,15 @@ class EngineArgs:
             shutdown_timeout=self.shutdown_timeout,
         )
         config.quest_config = _quest_config_from_args(self)
+        if config.quest_config is not None and config.quest_config.enabled:
+            if config.attention_config.backend is None:
+                config.attention_config.backend = AttentionBackendEnum.CUSTOM
+            elif config.attention_config.backend != AttentionBackendEnum.CUSTOM:
+                raise ValueError(
+                    "enable_quest_sparse_offload conflicts with "
+                    f"attention_backend={config.attention_config.backend}; "
+                    "Quest claims the CUSTOM backend slot."
+                )
 
         return config
 
@@ -2652,6 +2661,7 @@ def _quest_config_from_args(args: "EngineArgs") -> "QuestConfig | None":
 
     if config_path:
         import json
+
         with open(config_path) as f:
             data = json.load(f)
         cfg = QuestConfig.from_dict(data)

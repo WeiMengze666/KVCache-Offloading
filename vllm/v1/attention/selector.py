@@ -74,6 +74,17 @@ def get_attn_backend(
 
     vllm_config = get_current_vllm_config()
 
+    quest_config = getattr(vllm_config, "quest_config", None)
+    if quest_config is not None and quest_config.enabled:
+        from vllm.v1.attention.backends.quest.registration import register
+
+        register()
+        # Quest backend is sparse; selector validates use_sparse == is_sparse.
+        # Per-layer dense delegation (full_kv_layers + prefill) happens inside
+        # QuestSparseOffloadImpl.forward — every Attention layer routes
+        # through the Quest backend at construction time.
+        use_sparse = True
+
     cache_config = vllm_config.cache_config
     if cache_config is not None and cache_config.user_specified_block_size:
         block_size = cache_config.block_size
