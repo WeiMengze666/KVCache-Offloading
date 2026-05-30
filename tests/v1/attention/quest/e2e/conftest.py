@@ -9,6 +9,7 @@ registered in pyproject.toml so default `pytest` runs skip these tests.
 from __future__ import annotations
 
 import gc
+import json
 import os
 from pathlib import Path
 
@@ -105,5 +106,39 @@ def dense_llm(quest_e2e_model_id):
     llm = LLM(model=quest_e2e_model_id, **_LLM_SHARED_KWARGS)
     yield llm
     del llm
+    gc.collect()
+    torch.accelerator.empty_cache()
+
+
+@pytest.fixture
+def quest_llm_factory(tmp_path, quest_e2e_model_id):
+    """Function-scoped factory: build an LLM with Quest enabled via the
+    official EngineArgs path (JSON file + enable_quest_sparse_offload=True).
+
+    The factory writes the QuestConfig to a temp JSON file, then constructs
+    LLM. All LLMs created in one test are tracked and torn down together at
+    fixture exit (`del` + `gc.collect()` + `torch.accelerator.empty_cache()`),
+    so consecutive tests don't accumulate GPU memory.
+    """
+    created = []
+
+    def _build(quest_config: QuestConfig):
+        from vllm import LLM
+
+        json_path = tmp_path / f"quest_cfg_{len(created)}.json"
+        json_path.write_text(json.dumps(quest_config.to_dict()))
+        llm = LLM(
+            model=quest_e2e_model_id,
+            enable_quest_sparse_offload=True,
+            quest_config=str(json_path),
+            **_LLM_SHARED_KWARGS,
+        )
+        created.append(llm)
+        return llm
+
+    yield _build
+
+    for llm in created:
+        del llm
     gc.collect()
     torch.accelerator.empty_cache()
