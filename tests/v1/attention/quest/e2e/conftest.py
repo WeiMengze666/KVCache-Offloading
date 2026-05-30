@@ -26,7 +26,7 @@ _LLM_SHARED_KWARGS = dict(
     dtype="float16",
     enforce_eager=True,
     max_model_len=2048,
-    gpu_memory_utilization=0.55,
+    gpu_memory_utilization=0.40,
     enable_prefix_caching=False,
 )
 
