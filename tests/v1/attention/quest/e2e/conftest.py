@@ -8,6 +8,7 @@ registered in pyproject.toml so default `pytest` runs skip these tests.
 
 from __future__ import annotations
 
+import gc
 import os
 from pathlib import Path
 
@@ -18,6 +19,15 @@ from vllm.config.quest import QuestConfig
 
 QUEST_E2E_MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct"
 MIN_GPU_MEMORY_GIB = 40
+
+# Per-session shared kwargs for both dense and quest LLM construction.
+_LLM_SHARED_KWARGS = dict(
+    dtype="float16",
+    enforce_eager=True,
+    max_model_len=2048,
+    gpu_memory_utilization=0.55,
+    enable_prefix_caching=False,
+)
 
 
 @pytest.fixture(scope="session")
@@ -81,3 +91,19 @@ def baseline_quest_config() -> QuestConfig:
         selection_impl="torch",
         enable_async_prefetch=False,
     )
+
+
+@pytest.fixture(scope="session")
+def dense_llm(quest_e2e_model_id):
+    """Session-scoped dense (non-Quest) LLM. Loaded once and shared across the
+    e2e tests that need a reference output. Quest is not enabled here, so the
+    quest module subtree must not be imported as a side effect (Phase A
+    invariant — verified by an existing unit test).
+    """
+    from vllm import LLM
+
+    llm = LLM(model=quest_e2e_model_id, **_LLM_SHARED_KWARGS)
+    yield llm
+    del llm
+    gc.collect()
+    torch.accelerator.empty_cache()
