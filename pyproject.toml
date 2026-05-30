@@ -111,6 +111,7 @@ markers = [
     "split: run this test as part of a split",
     "distributed: run this test only in distributed GPU tests",
     "optional: optional tests that are automatically skipped, include --optional to run them",
+    "real_model: opt-in tests that load a real model and run end-to-end through vLLM engine",
 ]
 
 [tool.ty.src]
