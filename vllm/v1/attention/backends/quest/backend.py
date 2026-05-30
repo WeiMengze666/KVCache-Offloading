@@ -58,7 +58,14 @@ class QuestSparseOffloadBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "QUEST_SPARSE_OFFLOAD"
+        # Returns the AttentionBackendEnum slot name. Quest backend is
+        # registered against AttentionBackendEnum.CUSTOM (see
+        # `vllm/v1/attention/backends/quest/registration.py`); upstream
+        # `Attention.__init__` does `AttentionBackendEnum[get_name()]`,
+        # so the literal must match a real enum member.
+        # The human-friendly identifier "QUEST_SPARSE_OFFLOAD" lives on
+        # `QuestConfig.backend_name` and is what shows up in logs.
+        return "CUSTOM"
 
     @staticmethod
     def get_impl_cls() -> type[AttentionImpl]:

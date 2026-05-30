@@ -7191,6 +7191,49 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
 
+        quest_config = getattr(self.vllm_config, "quest_config", None)
+        if quest_config is not None and quest_config.enabled:
+            from vllm.v1.attention.backends.quest.backend import (
+                QuestSparseOffloadBackend,
+            )
+            from vllm.v1.attention.backends.quest.metadata import (
+                QuestMetadataBuilder,
+            )
+
+            QuestSparseOffloadBackend.bind_runtime(
+                vllm_config=self.vllm_config,
+                kv_cache_config=self.kv_cache_config,
+                kv_caches=kv_caches,
+                layers=self.compilation_config.static_forward_context,
+            )
+            # Wire quest_layer_indices into every QuestMetadataBuilder.
+            # Without this, _is_full_kv_layer falls back to "True" for
+            # every layer and Quest sparse selection never runs.
+            full_set = set(quest_config.full_kv_layers)
+            layers_dict = self.compilation_config.static_forward_context
+            sorted_names = sorted(
+                layers_dict.keys(),
+                key=lambda n: layers_dict[n].layer_idx,
+            )
+            num_layers = (
+                max(layers_dict[n].layer_idx for n in sorted_names) + 1
+                if sorted_names
+                else 0
+            )
+            quest_layer_indices = torch.full((num_layers,), -1, dtype=torch.int32)
+            slot = 0
+            for name in sorted_names:
+                idx = layers_dict[name].layer_idx
+                if idx in full_set:
+                    continue
+                quest_layer_indices[idx] = slot
+                slot += 1
+            for kv_groups in self.attn_groups:
+                for group in kv_groups:
+                    for builder in group.metadata_builders:
+                        if isinstance(builder, QuestMetadataBuilder):
+                            builder.set_quest_layer_indices(quest_layer_indices)
+
         if (
             self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()

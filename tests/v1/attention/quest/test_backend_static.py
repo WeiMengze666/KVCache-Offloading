@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Static-method tests for QuestSparseOffloadBackend."""
+
 from __future__ import annotations
 
 import torch
@@ -10,7 +12,10 @@ def test_get_name():
         QuestSparseOffloadBackend,
     )
 
-    assert QuestSparseOffloadBackend.get_name() == "QUEST_SPARSE_OFFLOAD"
+    # Quest backend claims the AttentionBackendEnum.CUSTOM slot; the
+    # human-readable "QUEST_SPARSE_OFFLOAD" identifier is on QuestConfig
+    # .backend_name (config-level) and in logs, not on get_name().
+    assert QuestSparseOffloadBackend.get_name() == "CUSTOM"
 
 
 def test_get_impl_cls_returns_quest_impl():
