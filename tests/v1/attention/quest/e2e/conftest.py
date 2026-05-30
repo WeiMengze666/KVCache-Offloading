@@ -25,9 +25,11 @@ MIN_GPU_MEMORY_GIB = 40
 _LLM_SHARED_KWARGS = dict(
     dtype="float16",
     enforce_eager=True,
-    max_model_len=2048,
-    gpu_memory_utilization=0.40,
+    max_model_len=1024,
+    gpu_memory_utilization=0.50,
     enable_prefix_caching=False,
+    enable_chunked_prefill=False,
+    block_size=256,
 )
 
 
@@ -94,12 +96,15 @@ def baseline_quest_config() -> QuestConfig:
     )
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def dense_llm(quest_e2e_model_id):
-    """Session-scoped dense (non-Quest) LLM. Loaded once and shared across the
-    e2e tests that need a reference output. Quest is not enabled here, so the
-    quest module subtree must not be imported as a side effect (Phase A
-    invariant — verified by an existing unit test).
+    """Function-scoped dense (non-Quest) LLM. Quest LLMs hold their own KV
+    pool + TierManager + CPU spill buffer; co-locating a session-scoped
+    dense LLM with a per-test Quest LLM exceeds GPU memory under realistic
+    `gpu_memory_utilization`. Function scope adds ~10s per test that uses
+    this fixture but lets each test run with the full memory budget. Quest
+    is not enabled here, so the quest module subtree must not be imported
+    as a side effect (Phase A invariant — verified by an existing unit test).
     """
     from vllm import LLM
 

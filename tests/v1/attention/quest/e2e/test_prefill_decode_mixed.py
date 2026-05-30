@@ -66,13 +66,15 @@ from vllm import SamplingParams
 pytestmark = pytest.mark.real_model
 
 
-# ~600+ tokens, definitely multi-block under block_size=256. Repeated 6x to
-# guarantee at least one full Quest block boundary fires during prefill.
+# ~600+ actual tokens, definitely multi-block under block_size=256. The
+# original 6x multiplier produced only ~150 tokens (English averages ~4
+# chars/token), too few to fill a single Quest block during prefill. 20x
+# yields ~500-600 tokens which crosses two block boundaries reliably.
 _LONG_PROMPT = (
     "In the spring of the year 1789, the assembly convened in Versailles "
     "to address grievances that had accumulated over decades of fiscal "
     "mismanagement and shifting alliances among the nobility. "
-) * 6
+) * 20
 
 _SHORT_PROMPT = "The capital of France is"
 
@@ -93,7 +95,10 @@ def _probe_quest_layers(model):
         tm = getattr(mod, "tier_manager", None)
         if tm is None:
             continue
-        s = getattr(tm, "stats", None)
+        # tier_manager.stats is a method (not a property); call to get the
+        # QuestStats dataclass instance.
+        stats_fn = getattr(tm, "stats", None)
+        s = stats_fn() if callable(stats_fn) else None
         out.append(
             {
                 "name": name,
@@ -120,17 +125,6 @@ def _collect_stats(llm):
     return flat
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "R-E1-4: enable_quest_sparse_offload=True does not flip "
-        "attention_config.backend to AttentionBackendEnum.CUSTOM. The v1 "
-        "selector picks FlashAttentionBackend for every layer, "
-        "QuestSparseOffloadBackend.bind_runtime filters them out, and no "
-        "TierManager is attached. Test will XPASS once the integration is "
-        "wired (auto-set CUSTOM backend + propagate use_sparse=True)."
-    ),
-)
 def test_quest_mixed_prefill_decode_engages_sparse_path(
     monkeypatch,
     baseline_quest_config,
@@ -143,7 +137,11 @@ def test_quest_mixed_prefill_decode_engages_sparse_path(
     quest_llm = quest_llm_factory(baseline_quest_config)
     params = SamplingParams(temperature=0.0, max_tokens=16)
 
-    outputs = quest_llm.generate([_LONG_PROMPT, _SHORT_PROMPT], params, use_tqdm=False)
+    # Use two copies of the long prompt (each ~500-600 tokens, > block_size=256)
+    # so every seq in the batch has at least one fully-filled Quest block
+    # before decode starts. Mixing in a short prompt would force the whole
+    # batch back to dense per the seq_too_short gate in QuestSparseOffloadImpl.
+    outputs = quest_llm.generate([_LONG_PROMPT, _LONG_PROMPT], params, use_tqdm=False)
     assert len(outputs) == 2
 
     for i, out in enumerate(outputs):
