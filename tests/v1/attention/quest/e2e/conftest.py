@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm.config.quest import QuestConfig
+
 QUEST_E2E_MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct"
 MIN_GPU_MEMORY_GIB = 40
 
@@ -60,3 +62,22 @@ def _real_model_e2e_gates(request, quest_e2e_model_id):
             f"HF cache missing {quest_e2e_model_id}. "
             f"Run: huggingface-cli download {quest_e2e_model_id}"
         )
+
+
+@pytest.fixture
+def baseline_quest_config() -> QuestConfig:
+    """Function-scoped baseline. Returning a fresh instance per test means
+    `dataclasses.replace(...)` mutations from one test never leak into another
+    via the mutable `full_kv_layers` list.
+    """
+    return QuestConfig(
+        enabled=True,
+        block_size=256,
+        top_k=64,
+        full_kv_layers=[0, 1],
+        gpu_cache_blocks_per_seq=512,
+        cpu_cache_blocks=8192,
+        cpu_cache_gib=8,
+        selection_impl="torch",
+        enable_async_prefetch=False,
+    )
