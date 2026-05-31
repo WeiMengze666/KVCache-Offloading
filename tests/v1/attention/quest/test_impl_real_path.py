@@ -276,6 +276,53 @@ def test_run_sparse_decode_matches_dense_when_topk_equals_total(cuda):
     assert torch.allclose(out, ref.squeeze(1), atol=1e-3, rtol=1e-3)
 
 
+def test_run_sparse_decode_counts_selected_on_gpu(cuda):
+    """Item 2 acceptance: selected_on_gpu counts how many of the selected
+    blocks were ALREADY GPU-resident at selection time (before
+    ensure_resident pulls the rest back). Hand-computed expectation: with
+    4 candidate blocks, top_k=4 selecting all of them, and exactly 1 block
+    pre-evicted to CPU, selected_total == 4 and selected_on_gpu == 3.
+    """
+    pytest.importorskip("flash_attn")
+
+    from vllm.v1.attention.backends.quest.cache.residency import (
+        ResidencyState,
+    )
+    from vllm.v1.attention.backends.quest.impl_helpers import (
+        run_sparse_decode,
+    )
+
+    impl, layer, q, kv_cache, md, output = _build_real_path_state()
+    tm = layer.tier_manager
+    num_blocks = md.quest_top_k  # == 4, top_k selects every candidate
+
+    # Pre-evict block 0 to CPU so it is NOT resident when selection runs.
+    # Mirror the eviction dance used elsewhere (no _spill_to_cpu, to avoid
+    # an unwanted async D2H): copy into CPU pool, drop the GPU slot, flip
+    # residency. ensure_resident inside run_sparse_decode will pull it back.
+    cpu_slot = tm.cpu_store.alloc(0)
+    tm.cpu_store.store_block(0, cpu_slot, tm.gpu_k[0], tm.gpu_v[0])
+    tm._cpu_slots[(0, 0)] = cpu_slot
+    tm._slot_map.free((0, 0))
+    tm.residency.begin_evict(0, 0)
+    tm.residency.complete_evict(0, 0)
+
+    assert tm.is_resident(0, 0) is False
+    assert tm.count_resident(0, [0, 1, 2, 3]) == 3
+
+    run_sparse_decode(impl, layer, q, kv_cache, md, output)
+
+    s = tm.stats()
+    # All 4 candidate blocks selected (top_k == num_blocks), of which 3 were
+    # resident at selection time.
+    assert s.selected_total == num_blocks
+    assert s.selected_on_gpu == 3
+    # Invariant required by the spec.
+    assert 0 <= s.selected_on_gpu <= s.selected_total
+    # ensure_resident must have made block 0 resident again afterwards.
+    assert tm.residency.state(0, 0) == ResidencyState.ON_GPU
+
+
 def test_run_sparse_decode_waits_on_ensure_resident_event(cuda):
     """When stream_pool is set, ensure_resident returns an Event;
     run_sparse_decode must wait on it before calling flash_attn_with_kvcache.

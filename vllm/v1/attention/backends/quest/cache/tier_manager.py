@@ -94,6 +94,8 @@ class TierManager:
         residency: BlockResidency,
         cpu_store: CpuKvBackingStore,
         stream_pool: QuestStreamPool | None = None,
+        enable_event_timing: bool = False,
+        gpu_pool_aliases_kv_cache: bool = False,
     ) -> None:
         self.layer_idx = layer_idx
         self.gpu_budget = gpu_budget
@@ -103,6 +105,21 @@ class TierManager:
         self.residency = residency
         self.cpu_store = cpu_store
         self.stream_pool = stream_pool
+        # When True, gpu_k/gpu_v are a ZERO-COPY view of the engine-allocated
+        # kv_cache (gpu_budget == kv_cache.shape[0]) rather than a private
+        # Quest buffer. In this mode the KV for every logical block already
+        # lives at the engine's paged slot (md.block_table[req, logical_id]),
+        # so on_block_filled must NOT copy KV into its LRU slot (that slot
+        # aliases a DIFFERENT engine row and the copy corrupts it), and the
+        # decode read path gathers blocks via block_table, not logical_to_slot.
+        # Set by init_runtime_state when binding to a real engine; False for
+        # unit tests that construct a private gpu_k/gpu_v.
+        self.gpu_pool_aliases_kv_cache = gpu_pool_aliases_kv_cache
+        # Benchmark/debug-only: when True, ensure_resident / _spill_to_cpu
+        # bracket their copies with cuda Events and accumulate GPU time into
+        # _stats. Zero-cost when False (no Event creation, no sync). Gated by
+        # QuestConfig.enable_debug_counters at construction time.
+        self.enable_event_timing = enable_event_timing
 
         self._slot_map = _LRUSlotMap(capacity=gpu_budget)
         # Per-evicted (seq_id, logical_block_id) -> cpu_slot
@@ -114,6 +131,28 @@ class TierManager:
 
     def logical_to_slot(self, seq_id: int, logical_block_id: int) -> int:
         return self._slot_map.get((seq_id, logical_block_id))
+
+    def is_resident(self, seq_id: int, logical_block_id: int) -> bool:
+        """True iff (seq_id, logical_block_id) currently holds a GPU slot.
+
+        Read-only: does NOT touch LRU recency (unlike logical_to_slot, which
+        calls _slot_map.get and bumps the key to most-recently-used). Used by
+        the selection path to measure GPU-residency hit-rate *before*
+        ensure_resident makes everything resident.
+        """
+        return (seq_id, logical_block_id) in self._slot_map
+
+    def count_resident(self, seq_id: int, logical_block_ids) -> int:
+        """How many of `logical_block_ids` are already GPU-resident.
+
+        `logical_block_ids` is any iterable of ints (e.g. ``top_ids.tolist()``).
+        Cheap set membership over the LRU map; no GPU sync, no LRU mutation.
+        """
+        return sum(
+            1
+            for bid in logical_block_ids
+            if (seq_id, int(bid)) in self._slot_map
+        )
 
     def on_block_filled(
         self,
@@ -136,8 +175,19 @@ class TierManager:
             # Spill the evicted block's data BEFORE we overwrite the slot.
             self._spill_to_cpu(*evicted, slot=slot)
 
-        self.gpu_k[slot].copy_(k_block, non_blocking=False)
-        self.gpu_v[slot].copy_(v_block, non_blocking=False)
+        if not self.gpu_pool_aliases_kv_cache:
+            self.gpu_k[slot].copy_(k_block, non_blocking=False)
+            self.gpu_v[slot].copy_(v_block, non_blocking=False)
+        # When the pool is a zero-copy view of the engine kv_cache
+        # (gpu_pool_aliases_kv_cache=True), the KV already lives at the
+        # engine's paged slot and the sparse-decode read path gathers it via
+        # md.block_table. Copying here would instead write into this LRU
+        # slot's *aliased* engine row (a DIFFERENT physical block than the
+        # one the engine allocated to this sequence), corrupting whatever the
+        # engine keeps there. So the copy is both redundant and harmful in
+        # that mode and is skipped; only the summary (above) + LRU/residency
+        # bookkeeping are maintained. See run_sparse_decode for the read-side
+        # counterpart and the architecture note.
         self.residency.mark_on_gpu(self.layer_idx, logical_block_id)
         self._stats.block_filled += 1
         return slot
@@ -152,15 +202,47 @@ class TierManager:
         returns an Event the caller waits on before reading the slots.
         """
         ids = logical_block_ids.cpu().tolist()
-        if self.stream_pool is None:
+        if self.gpu_pool_aliases_kv_cache:
+            # Aliasing mode: gpu_k/gpu_v ARE the engine kv_cache; every block
+            # is always physically present at its engine paged slot and the
+            # decode path reads it via md.block_table. There is nothing to pull
+            # back from the CPU tier (it is never populated in this mode — see
+            # on_block_filled / _spill_to_cpu), so residency is trivially
+            # satisfied. Touch the LRU recency for selected blocks (so eviction
+            # order stays sensible if the pool ever fills) and return no event.
             for bid in ids:
-                self._ensure_one_sync(seq_id, bid)
+                if (seq_id, bid) in self._slot_map:
+                    self._slot_map.get((seq_id, bid))
+            return None
+        if self.stream_pool is None:
+            if self.enable_event_timing:
+                self._timed_ensure_sync(seq_id, ids)
+            else:
+                for bid in ids:
+                    self._ensure_one_sync(seq_id, bid)
             return None
 
         with torch.cuda.stream(self.stream_pool.h2d_stream):
             for bid in ids:
                 self._ensure_one_async(seq_id, bid)
         return self.stream_pool.record_h2d_done()
+
+    def _timed_ensure_sync(self, seq_id: int, ids: list[int]) -> None:
+        """Benchmark-only: run the sync ensure loop bracketed by cuda Events
+        and accumulate H2D-wait GPU time. Only counts the interval when at
+        least one block actually loaded from CPU (resident blocks are free).
+        """
+        loads_before = self._stats.load_h2d
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for bid in ids:
+            self._ensure_one_sync(seq_id, bid)
+        end.record()
+        end.synchronize()
+        if self._stats.load_h2d > loads_before:
+            self._stats.h2d_wait_ms += start.elapsed_time(end)
+            self._stats.h2d_wait_events += 1
 
     def _ensure_one_sync(self, seq_id: int, bid: int) -> None:
         key = (seq_id, bid)
@@ -232,13 +314,38 @@ class TierManager:
         the source tensor keeps PyTorch's caching allocator from recycling
         the underlying memory until d2h_stream finishes the copy.
         """
+        if self.gpu_pool_aliases_kv_cache:
+            # Aliasing mode: the "slot" is an engine kv_cache row, not a
+            # private Quest buffer. Spilling it to CPU would (a) snapshot data
+            # the engine still owns and (b) imply a later H2D back into that
+            # aliased row, corrupting the engine. The decode read path never
+            # consults the CPU tier in this mode (it reads via block_table),
+            # so the only thing eviction needs to do is drop the LRU entry,
+            # which the caller (_LRUSlotMap.add) has already done. Just mark
+            # the residency state; no data movement.
+            self.residency.begin_evict(self.layer_idx, logical_block_id)
+            self.residency.complete_evict(self.layer_idx, logical_block_id)
+            return
         cpu_slot = self.cpu_store.alloc(self.layer_idx)
         self.residency.begin_evict(self.layer_idx, logical_block_id)
         if self.stream_pool is None:
-            self.cpu_store.store_block(
-                self.layer_idx, cpu_slot,
-                self.gpu_k[slot], self.gpu_v[slot],
-            )
+            if self.enable_event_timing:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                self.cpu_store.store_block(
+                    self.layer_idx, cpu_slot,
+                    self.gpu_k[slot], self.gpu_v[slot],
+                )
+                end.record()
+                end.synchronize()
+                self._stats.evict_stall_ms += start.elapsed_time(end)
+                self._stats.evict_stall_events += 1
+            else:
+                self.cpu_store.store_block(
+                    self.layer_idx, cpu_slot,
+                    self.gpu_k[slot], self.gpu_v[slot],
+                )
         else:
             d2h = self.stream_pool.d2h_stream
             # Tell the allocator: don't recycle these GPU tensors until

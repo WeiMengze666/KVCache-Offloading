@@ -157,13 +157,20 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     out_chunks = []
     for req_idx in range(num_reqs):
         sl = int(seq_lens[req_idx].item())
-        # Quest can only score *fully filled* blocks (the trailing partial
-        # block has no entry in tier_manager yet — only `on_block_filled`
-        # registers a block, and that fires on block boundaries). Use floor
-        # division so the trailing partial block is treated as buffer that
-        # the caller's seq_too_short gate handles.
-        num_blocks = sl // block_size
-        cand = torch.arange(num_blocks, dtype=torch.int32, device=query.device)
+        # Quest scores only *fully filled* blocks: the trailing partial block
+        # has no tier_manager entry (on_block_filled registers a block only on
+        # a block boundary) and no summary, so it cannot be scored. But that
+        # partial block holds the just-generated decode token (at position
+        # sl-1), which the query MUST attend to — including itself. So we
+        # score/select among the full blocks only, then UNCONDITIONALLY append
+        # the partial block to the gather as an always-resident "recent
+        # window": never scored, never selected, never evicted. This makes the
+        # sparse decode attend the SAME token set as dense FA (all `sl`
+        # positions), which is what the seq_too_short gate could not guarantee
+        # for steps past the first.
+        full_blocks = sl // block_size
+        has_partial = (sl % block_size) != 0
+        cand = torch.arange(full_blocks, dtype=torch.int32, device=query.device)
         # build [num_kv_heads * G, head_size] view for the last query token
         q_token = query[req_idx]  # [num_heads, head_size]
         # Score using the per-layer summary row. tm.layer_idx is the quest
@@ -176,11 +183,20 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
             block_summary=summary_layer,
             candidate_ids=cand,
             num_kv_groups=layer.num_heads // layer.num_kv_heads,
-            top_k=min(top_k, num_blocks),
+            top_k=min(top_k, full_blocks),
         )
         per_req_top_ids.append(top_ids)
         if tm_stats is not None:
             tm_stats._stats.selected_total += int(top_ids.numel())
+            # GPU-residency hit-rate numerator: how many of the just-selected
+            # blocks are ALREADY on GPU at selection time. Must be measured
+            # here, BEFORE ensure_resident below makes everything resident
+            # (after which the metric would always read 100%). Cheap set
+            # membership over the LRU map; no GPU sync, no LRU mutation.
+            tm_stats._stats.selected_on_gpu += tm.count_resident(
+                seq_id=req_idx,
+                logical_block_ids=top_ids.tolist(),
+            )
         # Wait on H2D completion before kernel reads the slots. Sync mode
         # returns None (no wait); async mode returns an Event we must
         # serialize the compute stream against.
@@ -190,17 +206,52 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         )
         if h2d_event is not None:
             torch.cuda.current_stream().wait_event(h2d_event)
-        # Translate logical block ids to physical GPU slots.
+        # Translate selected logical block ids to PHYSICAL kv_cache rows.
+        #
+        # init_runtime_state binds tm.gpu_k/gpu_v as ZERO-COPY views of the
+        # engine-allocated kv_cache (gpu_k = kv_cache[:,0]; gpu_budget ==
+        # kv_cache.shape[0], the FULL cache — confirmed at runtime). So the
+        # authoritative physical row for ANY logical block is the vLLM paged
+        # slot md.block_table[req_idx, logical_id] — that is where the engine's
+        # reshape_and_cache_flash actually wrote (and keeps) the KV.
+        #
+        # We deliberately do NOT use tm.logical_to_slot here: the Quest LRU
+        # hands out pool slots from its own free list (0,1,2,...), which alias
+        # *different* physical rows than the ones vLLM allocated to this
+        # sequence. Those aliased rows get clobbered between prefill and decode
+        # (the two allocators collide over one shared tensor), so reading the
+        # pool slot returns garbage for the selected full blocks. Gathering
+        # from block_table reads the correct, engine-maintained rows. Selection,
+        # ensure_resident and the residency stats still run over top_ids above
+        # (unchanged); only the physical READ source is corrected here.
+        slot_list = [
+            int(md.block_table[req_idx, int(b)].item())
+            for b in top_ids.tolist()
+        ]
+        # Number of FULL blocks actually gathered (top_k may be < full_blocks).
+        num_full_gathered = len(slot_list)
+        # ALWAYS append the trailing partial block (the live decode token). It
+        # is NOT in tier_manager; its KV physically lives at the vLLM-allocated
+        # paged slot block_table[req_idx, full_blocks], written by the engine's
+        # do_kv_cache_update before this forward. Never scored, never evicted.
+        if has_partial:
+            partial_slot = int(md.block_table[req_idx, full_blocks].item())
+            slot_list.append(partial_slot)
         slots = torch.tensor(
-            [
-                tm.logical_to_slot(seq_id=req_idx, logical_block_id=int(b))
-                for b in top_ids.tolist()
-            ],
+            slot_list,
             dtype=torch.int32,
             device=query.device,
         ).unsqueeze(0)
+        # TRUE attended length: the full blocks contribute whole blocks; if a
+        # partial block is appended it sits immediately after them in the
+        # gather, so its live tokens occupy positions
+        # [num_full_gathered*block_size, num_full_gathered*block_size + residual).
+        # cache_seqlens must point one past the decode token so the kernel
+        # attends it (and, with causal=True, attends itself).
+        residual = (sl % block_size) if has_partial else 0
+        sl_effective = num_full_gathered * block_size + residual
         sub_seq_len = torch.tensor(
-            [slots.numel() * block_size],
+            [sl_effective],
             dtype=torch.int32,
             device=query.device,
         )

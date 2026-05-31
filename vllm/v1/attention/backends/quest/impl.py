@@ -15,9 +15,9 @@ class QuestSparseOffloadImpl(AttentionImpl):
       - prefill (max_query_len > 1) OR layer is in full_kv_layers:
           delegate to FlashAttentionImpl as in Phase A.
       - decode of a Quest layer:
-          1. write current K/V to GPU cache (reshape_and_cache_flash) —
-             same as FA does, so this happens via the FA forward we still
-             call for the cache update step.
+          1. KV for this step is already written into the GPU cache by the
+             engine via do_kv_cache_update (forward_includes_kv_cache_update
+             is False), which runs BEFORE this forward on every path.
           2. on each newly-completed block (slot_mapping spans a block
              boundary), tier_manager.on_block_filled.
           3. quest_selection over candidate_ids = ON_GPU + ON_CPU blocks.
@@ -101,8 +101,9 @@ class QuestSparseOffloadImpl(AttentionImpl):
         )
         if is_prefill or full_kv or any_seq_too_short:
             # Prefill always runs full attention (spec §1). Full-KV layers
-            # always delegate, regardless of phase. Both share the standard
-            # FA forward — including reshape_and_cache_flash for KV write.
+            # always delegate, regardless of phase. KV was already written by
+            # the engine via do_kv_cache_update (forward_includes_kv_cache_update
+            # is False) before this forward ran, so FA forward only reads.
             out = self._fa_impl.forward(
                 layer,
                 query,
@@ -125,15 +126,11 @@ class QuestSparseOffloadImpl(AttentionImpl):
             )
             return out
 
-        # Decode of a Quest layer: write KV first via the standard helper,
-        # then run the sparse path.
-        self._write_kv_via_fa_helper(
-            layer,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-        )
+        # Decode of a Quest layer. KV for this step was already written by the
+        # engine via do_kv_cache_update before this forward ran, so we go
+        # straight to notifying filled blocks (reads from kv_cache) and the
+        # sparse path — no manual reshape_and_cache_flash here (that would
+        # double-write).
         self._notify_filled_blocks_after_decode(
             layer,
             kv_cache,
@@ -147,6 +144,29 @@ class QuestSparseOffloadImpl(AttentionImpl):
             output,
         )
 
+    def do_kv_cache_update(
+        self,
+        layer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Engine-driven KV cache write (new "KV write is a separate op"
+        contract; see Attention.forward -> unified_kv_cache_update). Runs
+        BEFORE forward on every path. Delegate to FlashAttentionImpl so the
+        write is byte-identical to the dense backend (reshape_and_cache_flash
+        with the layer's k/v scales). This is the single KV write per step
+        per layer — the sparse decode path must NOT write KV again.
+        """
+        self._fa_impl.do_kv_cache_update(
+            layer,
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+        )
+
     # ----- private helpers (see Task 14 for full bodies) -----
 
     def _is_full_kv_layer(self, layer, attn_metadata) -> bool:
@@ -154,21 +174,6 @@ class QuestSparseOffloadImpl(AttentionImpl):
         if idx is None or idx.numel() == 0:
             return True  # safe default = behave like FA
         return bool(idx[layer.layer_idx].item() < 0)
-
-    def _write_kv_via_fa_helper(self, layer, key, value, kv_cache, md):
-        from vllm._custom_ops import reshape_and_cache_flash
-
-        n = md.num_actual_tokens
-        reshape_and_cache_flash(
-            key[:n],
-            value[:n],
-            kv_cache[:, 0],
-            kv_cache[:, 1],
-            md.slot_mapping[:n],
-            self.kv_cache_dtype,
-            layer._k_scale,
-            layer._v_scale,
-        )
 
     def _notify_filled_blocks_after_prefill(self, layer, key, value, md):
         # Implementation in Task 14 hooks tier_manager via forward_context.

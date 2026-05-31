@@ -180,3 +180,25 @@ def test_quest_mixed_prefill_decode_engages_sparse_path(
         f"load_h2d={total_h2d} went negative across "
         f"{len(layer_stats)} Quest layer(s) — counter corruption."
     )
+
+    # Stage 0 Item 2: the selected_on_gpu hit-rate counter must be wired up.
+    # With gpu_cache_blocks_per_seq=512 and ~600-token prompts (~3 blocks of
+    # 256) nothing is ever evicted, so every selected block is resident and
+    # selected_on_gpu should equal selected_total. The invariant
+    # 0 <= selected_on_gpu <= selected_total must always hold; and because
+    # selection ran on resident blocks, selected_on_gpu must be > 0 (populated,
+    # not stuck at the never-incremented default).
+    total_on_gpu = sum(
+        s["stats"]["selected_on_gpu"] for s in layer_stats if s["stats"]
+    )
+    assert 0 <= total_on_gpu <= total_selected, (
+        f"selected_on_gpu={total_on_gpu} outside [0, "
+        f"selected_total={total_selected}] across {len(layer_stats)} "
+        f"Quest layer(s) — counter corruption or measured after "
+        f"ensure_resident."
+    )
+    assert total_on_gpu > 0, (
+        f"selected_on_gpu=0 across {len(layer_stats)} Quest layer(s) despite "
+        f"selected_total={total_selected} on a no-eviction run — the "
+        f"selected_on_gpu counter is not being incremented (Stage 0 Item 2)."
+    )

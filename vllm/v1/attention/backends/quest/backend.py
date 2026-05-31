@@ -46,6 +46,14 @@ class QuestSparseOffloadBackend(AttentionBackend):
        reclamation events.
     """
 
+    # vLLM's "KV write is a separate op" contract: when False, the engine
+    # (Attention.forward -> unified_kv_cache_update -> impl.do_kv_cache_update)
+    # performs the KV cache write BEFORE impl.forward runs, on every path.
+    # Mirror FlashAttentionBackend (flash_attn.py:96), whose forward no longer
+    # writes KV. We delegate the write to FlashAttentionImpl.do_kv_cache_update
+    # via QuestSparseOffloadImpl.do_kv_cache_update.
+    forward_includes_kv_cache_update: bool = False
+
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
         torch.bfloat16,
@@ -268,6 +276,13 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 gpu_k = full[:, 0]
                 gpu_v = full[:, 1]
                 gpu_budget = full.shape[0]
+                # gpu_k/gpu_v alias the engine's kv_cache (not a private Quest
+                # buffer). The KV for every logical block already lives at the
+                # engine paged slot md.block_table[req, logical_id]; the sparse
+                # decode read path gathers from there and on_block_filled must
+                # NOT copy KV into its aliased LRU slot. Flag it so TierManager
+                # skips the harmful/redundant copy + CPU tier movement.
+                pool_aliases_kv_cache = True
             else:
                 if kv_caches is not None:
                     logger.warning(
@@ -290,6 +305,9 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 )
                 gpu_v = torch.empty_like(gpu_k)
                 gpu_budget = quest_config.gpu_cache_blocks_per_seq
+                # Private buffer: on_block_filled copies KV in and the decode
+                # read path reads via logical_to_slot (unit-test path).
+                pool_aliases_kv_cache = False
             layer.tier_manager = TierManager(
                 layer_idx=slot,
                 gpu_budget=gpu_budget,
@@ -299,6 +317,8 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 residency=residency,
                 cpu_store=cpu_store,
                 stream_pool=stream_pool,
+                enable_event_timing=quest_config.enable_debug_counters,
+                gpu_pool_aliases_kv_cache=pool_aliases_kv_cache,
             )
             layer._quest_selection_callable_ref = selection_callable
 
