@@ -845,3 +845,37 @@ class TestReport:
         md = (tmp_path / "report.md").read_text()
         # quest pool128 useful = 4 GiB, dense useful = 9 GiB → 4/9 ≈ 0.44
         assert "0.44" in md or "44%" in md or "44 %" in md
+
+
+class TestAttachIntrospection:
+    def test_attach_finds_tier_managers_via_attention_layers(self):
+        import types
+
+        from benchmarks.quest_memory_probe import probes
+
+        tms = [FakeTM(0, 1, 0), FakeTM(1, 2, 0)]
+        layers = [
+            types.SimpleNamespace(impl=types.SimpleNamespace(tier_manager=tm))
+            for tm in tms
+        ]
+
+        class Runner:
+            attention_layers = layers
+
+        class Worker:
+            model_runner = Runner()
+
+        found = probes._collect_tier_managers(Worker())
+        assert len(found) == 2
+        assert found[0] is tms[0]
+
+    def test_attach_returns_empty_for_dense_runner(self):
+        from benchmarks.quest_memory_probe import probes
+
+        class Runner:
+            pass
+
+        class Worker:
+            model_runner = Runner()
+
+        assert probes._collect_tier_managers(Worker()) == []

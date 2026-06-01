@@ -120,6 +120,16 @@ def execute(cfg: RunConfig, out_dir: Path) -> None:
             kwargs = _make_engine_kwargs(cfg, quest_json_path=quest_json)
             llm = LLM(**kwargs)
 
+            # One-shot introspection for the log; helps debug if the
+            # collective_rpc probe later finds 0 tier_managers.
+            try:
+                n_tm = llm.llm_engine.collective_rpc(
+                    lambda w: len(probes._collect_tier_managers(w))
+                )[0]
+                print(f"[runner] discovered {n_tm} TierManager(s) on cfg={cfg.name}")
+            except Exception as e:
+                print(f"[runner] introspection failed: {e!r}")
+
             # Cache bytes_per_block once; it's a function of layer geometry.
             try:
                 bpb = llm.llm_engine.collective_rpc(probes.probe_bytes_per_block)[0]

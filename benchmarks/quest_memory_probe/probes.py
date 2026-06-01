@@ -54,14 +54,19 @@ def _collect_tier_managers(worker) -> list[Any]:
     helper = getattr(runner, "quest_tier_managers_for_probe", None)
     if helper is not None:
         return list(helper())
-    layers = getattr(runner, "attn_layers", None) or []
-    out = []
-    for layer in layers:
-        impl = getattr(layer, "impl", None)
-        tm = getattr(impl, "tier_manager", None)
-        if tm is not None:
-            out.append(tm)
-    return out
+    # Try several attribute names where vLLM might keep attention layers.
+    for attr in ("attn_layers", "attention_layers", "_attn_layers"):
+        layers = getattr(runner, attr, None)
+        if layers:
+            out = []
+            for layer in layers:
+                impl = getattr(layer, "impl", None)
+                tm = getattr(impl, "tier_manager", None)
+                if tm is not None:
+                    out.append(tm)
+            if out:
+                return out
+    return []
 
 
 def _aggregate_quest(tms: list[Any]) -> dict[str, Any]:
