@@ -33,8 +33,16 @@ def _nvtx_range(name: str, enabled: bool):
 
 def notify_filled_blocks_after_prefill(layer, key, value, md) -> None:
     """Called right after FA's prefill writes KV. Walks slot_mapping to
-    detect block boundaries; for each boundary crossed, hands the just-
-    completed K/V block to the layer's TierManager."""
+    detect block boundaries; for each boundary crossed, registers the just-
+    completed block's SUMMARY with the layer's TierManager.
+
+    Summary-only by design: prefill leaves all prompt blocks in the engine's
+    paged cache (full residency); the bounded Quest arena is populated only by
+    the one-shot trim_to_working_set at the prefill->decode boundary. Copying
+    blocks into the arena here would overflow it for prompts longer than `cap`
+    blocks (and pre-spill blocks the trim then double-evicts). See
+    TierManager.register_prefill_summary.
+    """
     tm: TierManager | None = getattr(layer, "tier_manager", None)
     if tm is None:
         return
@@ -56,11 +64,10 @@ def notify_filled_blocks_after_prefill(layer, key, value, md) -> None:
             tok_lo = beg + b * block_size
             tok_hi = tok_lo + block_size
             block_id = b
-            tm.on_block_filled(
+            tm.register_prefill_summary(
                 seq_id=req_idx,
                 logical_block_id=block_id,
                 k_block=key[tok_lo:tok_hi],
-                v_block=value[tok_lo:tok_hi],
             )
 
 
@@ -247,10 +254,18 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         # Wait on H2D completion before kernel reads the slots. Sync mode
         # returns None (no wait); async mode returns an Event we must
         # serialize the compute stream against.
+        #
+        # keep_resident_ids protects the live partial block (key full_blocks)
+        # from being self-evicted while ensure_resident reloads selected misses:
+        # it is appended to the gather but is never in top_ids, so without this
+        # the two-pass touch wouldn't know to shield it. When there is no
+        # partial block (exact boundary) there is nothing extra to keep.
+        keep_ids = [full_blocks] if has_partial else None
         with _nvtx_range(f"quest.ensure_resident.L{tm.layer_idx}", nvtx_gate):
             h2d_event = tm.ensure_resident(
                 seq_id=req_idx,
                 logical_block_ids=top_ids,
+                keep_resident_ids=keep_ids,
             )
             if h2d_event is not None:
                 torch.cuda.current_stream().wait_event(h2d_event)
@@ -264,8 +279,7 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         slot_list = [
             tm.logical_to_slot(seq_id=req_idx, logical_block_id=int(b))
             for b in top_ids.tolist()
-        ]
-        # Number of FULL blocks actually gathered (top_k may be < full_blocks).
+        ]        # Number of FULL blocks actually gathered (top_k may be < full_blocks).
         num_full_gathered = len(slot_list)
         # Trailing PARTIAL block lifecycle (Stages A/B/C — see Task 5b):
         #  A (management): the partial block holds the live decode token at

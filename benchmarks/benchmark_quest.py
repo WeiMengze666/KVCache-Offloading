@@ -137,9 +137,12 @@ def _run_meta(argv: list[str]) -> dict:
         "argv": list(argv),
         "gpu_name": gpu_name,
         "driver": driver,
-        # Stage-1 records are the offload-bypassed baseline; Stage 2 emits "real".
-        "offload_mode_note": "bypassed (experiment-s0): TierManager dormant, "
-                             "gpu pool aliases full engine cache",
+        # Stage-1 records were the offload-bypassed baseline; Stage 2A makes
+        # offload real (bounded Quest-owned GPU arena + CPU spill/reload).
+        "offload_mode_note": "real (Stage 2A): bounded GPU arena of "
+                             "gpu_cache_blocks_per_seq blocks per Quest layer; "
+                             "trim spills overflow to pinned CPU, ensure_resident "
+                             "reloads selected blocks (H2D) on the engine path",
     }
 
 
@@ -827,19 +830,19 @@ def build_run_plan(args) -> list[RunConfig]:
                 name=f"quest_topk{label}", quest_enabled=True,
                 top_k=k,
                 gpu_cache_blocks_per_seq=args.large_gpu_blocks,
-                expect_offload=False, **sweep_common,
+                expect_offload=False, offload_mode="real", **sweep_common,
             ))
     else:
         dense = RunConfig(name="dense", quest_enabled=False, **common)
         quest_no_off = RunConfig(
             name="quest_no_offload", quest_enabled=True,
             gpu_cache_blocks_per_seq=args.large_gpu_blocks,
-            expect_offload=False, **common,
+            expect_offload=False, offload_mode="real", **common,
         )
         quest_offload = RunConfig(
             name="quest_offload", quest_enabled=True,
             gpu_cache_blocks_per_seq=args.small_gpu_blocks,
-            expect_offload=True, **common,
+            expect_offload=True, offload_mode="real", **common,
         )
         base = [dense, quest_no_off, quest_offload]
 
@@ -926,9 +929,11 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--large-gpu-blocks", type=int, default=512,
                    help="gpu_cache_blocks_per_seq for the no-offload point")
-    p.add_argument("--small-gpu-blocks", type=int, default=4,
+    p.add_argument("--small-gpu-blocks", type=int, default=8,
                    help="gpu_cache_blocks_per_seq for the forced-offload point; "
-                        "must be < blocks the prompt produces AND >= --top-k")
+                        "must be < blocks the prompt produces AND >= --top-k + 1 "
+                        "(one arena slot is reserved for the live decode block, "
+                        "so the Quest invariant is top_k <= cap - 1)")
     p.add_argument("--profile", action="store_true",
                    help="wrap the INSTRUMENTED-pass worker under `nsys profile` "
                         "(never the clean pass — nsys perturbs timing) so the "

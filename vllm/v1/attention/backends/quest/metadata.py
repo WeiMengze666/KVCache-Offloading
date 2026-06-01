@@ -39,6 +39,13 @@ class QuestAttentionMetadata(FlashAttentionMetadata):
     )
     """Bool tensor of length num_layers; True for full-KV layers."""
 
+    quest_top_k: int = 64
+    """Number of logical blocks Quest selection keeps per decode step
+    (QuestConfig.top_k). Populated by QuestMetadataBuilder from the engine's
+    QuestConfig; the decode path clamps it to min(quest_top_k, full_blocks).
+    The default is only a fallback for unit-test metadata built without a
+    configured builder."""
+
 
 class QuestMetadataBuilder(FlashAttentionMetadataBuilder):
     """Delegates standard FA metadata then promotes to QuestAttentionMetadata.
@@ -51,9 +58,13 @@ class QuestMetadataBuilder(FlashAttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         self._fa_builder = self  # Phase B: build via super().build
         self._quest_layer_indices: torch.Tensor | None = None
+        self._quest_top_k: int = 64
 
     def set_quest_layer_indices(self, indices: torch.Tensor) -> None:
         self._quest_layer_indices = indices.to(torch.int32)
+
+    def set_quest_top_k(self, top_k: int) -> None:
+        self._quest_top_k = int(top_k)
 
     def build(self, *args, **kwargs) -> QuestAttentionMetadata:
         fa_md = super().build(*args, **kwargs)
@@ -80,4 +91,5 @@ class QuestMetadataBuilder(FlashAttentionMetadataBuilder):
             sparse_block_table=None,
             quest_layer_indices=idx,
             is_full_kv_layer=is_full,
+            quest_top_k=getattr(self, "_quest_top_k", 64),
         )

@@ -82,6 +82,46 @@ def _engine_worker(out_path: str, quest_json_path: str | None) -> None:
     Path(out_path).write_text(json.dumps({"text": text}))
 
 
+# Long prompt (~3000+ tokens) for the forced-overflow cap A/B test: it must
+# exceed SMALL_CAP blocks (8 * 256 = 2048 tokens) so the small-arena engine
+# genuinely spills, while the large-arena engine holds everything. The default
+# _PROMPT (~600 tokens) is far too short to overflow an 8-block arena.
+_LONG_PROMPT = (
+    "The Eiffel Tower was completed in 1889 for the World's Fair held in "
+    "Paris to celebrate the centennial of the French Revolution. It stood as "
+    "the tallest man-made structure in the world for forty-one years until "
+    "the Chrysler Building was finished in New York. "
+) * 60 + "\nQ: In what year was the Eiffel Tower completed?\nA:"
+
+# Same as _SHARED_KWARGS but with a longer context window so the long prompt
+# fits and the sequence spans well over SMALL_CAP blocks.
+_LONG_KWARGS = dict(_SHARED_KWARGS, max_model_len=4096)
+
+
+def _engine_worker_long(out_path: str, quest_json_path: str) -> None:
+    """Forced-overflow worker: long prompt + 4096 context, Quest always on."""
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(
+        model=QUEST_E2E_MODEL_ID,
+        enable_quest_sparse_offload=True,
+        quest_config=quest_json_path,
+        **_LONG_KWARGS,
+    )
+    sp = SamplingParams(max_tokens=8, temperature=0.0)
+    text = llm.generate([_LONG_PROMPT], sp, use_tqdm=False)[0].outputs[0].text
+    Path(out_path).write_text(json.dumps({"text": text}))
+
+
+def _run_long_engine_in_subprocess(out_path: str, quest_json_path: str) -> None:
+    ctx = mp.get_context("spawn")
+    p = ctx.Process(target=_engine_worker_long, args=(out_path, quest_json_path))
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        raise RuntimeError(f"long engine subprocess exited {p.exitcode}")
+
+
 def _run_engine_in_subprocess(out_path: str, quest_json_path: str | None) -> None:
     ctx = mp.get_context("spawn")
     p = ctx.Process(target=_engine_worker, args=(out_path, quest_json_path))
@@ -131,3 +171,39 @@ def test_quest_topk_full_matches_dense_fa(tmp_path):
     assert out_dense.strip() == out_quest.strip(), (
         f"dense={out_dense!r} quest={out_quest!r}"
     )
+
+
+@pytest.mark.slow_test
+def test_quest_offload_reload_lossless_small_vs_large_arena(tmp_path):
+    """Engine-level offload round-trip proof. Two Quest engines, SAME top_k,
+    DIFFERENT arena caps: a small cap that forces spill+reload vs a large cap
+    that never spills. Equal greedy text proves the spill->CPU->reload round
+    trip is lossless. This does NOT compare against dense (impossible under
+    overflow: you cannot gather > cap blocks in one flash_attn call); the R1
+    '== dense' invariant is covered by test_quest_topk_full_matches_dense_fa.
+    Requires top_k <= small_cap - 1 (arena holds top_k selected + 1 live block)
+    and a prompt long enough that the block count exceeds small_cap."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if os.environ.get("VLLM_QUEST_RUN_ALIGNMENT") != "1":
+        pytest.skip("set VLLM_QUEST_RUN_ALIGNMENT=1 to run this slow test")
+    from vllm.config.quest import QuestConfig
+
+    SMALL_CAP, TOP_K = 8, 6  # top_k <= cap-1 (6 <= 7); arena = 6 selected + 1 live
+
+    def quest_text(cap):
+        cfg = QuestConfig(enabled=True, top_k=TOP_K, gpu_cache_blocks_per_seq=cap,
+                          full_kv_layers=[0, 1], block_size=256,
+                          cpu_cache_blocks=8192, cpu_cache_gib=8,
+                          selection_impl="torch", enable_async_prefetch=False)
+        cfg.validate()
+        p = tmp_path / f"cfg_{cap}.json"
+        p.write_text(json.dumps(cfg.to_dict()))
+        out = tmp_path / f"q_{cap}.json"
+        _run_long_engine_in_subprocess(str(out), str(p))
+        return json.loads(out.read_text())["text"]
+
+    # Same top_k => same selection => equal text iff reload is lossless.
+    small = quest_text(SMALL_CAP)
+    big = quest_text(512)
+    assert small.strip() == big.strip(), f"small={small!r} big={big!r}"

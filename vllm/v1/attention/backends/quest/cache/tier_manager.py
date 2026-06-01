@@ -195,6 +195,25 @@ class TierManager:
             if (seq_id, int(bid)) in self._slot_map
         )
 
+    def register_prefill_summary(
+        self, seq_id: int, logical_block_id: int, k_block: torch.Tensor,
+    ) -> None:
+        """Prefill-time registration: record the per-block K summary ONLY.
+
+        During prefill the engine holds every prompt block in its own paged
+        cache; the bounded Quest arena is NOT populated until the one-shot
+        trim_to_working_set at the prefill->decode boundary. So prefill must
+        record the summary (the only thing selection needs, and the only thing
+        that must survive eviction) WITHOUT touching the arena LRU slot map or
+        the residency state machine — otherwise a prompt with more than `cap`
+        blocks would overflow the arena during prefill and spill blocks to CPU,
+        leaving the trim's begin_evict to find them already ON_CPU. The arena
+        residency is established exclusively by trim_to_working_set.
+        """
+        self.summary_store.on_block_filled(
+            self.layer_idx, logical_block_id, k_block,
+        )
+
     def on_block_filled(
         self,
         seq_id: int,
@@ -302,12 +321,28 @@ class TierManager:
         self,
         seq_id: int,
         logical_block_ids: torch.Tensor,
+        keep_resident_ids: "list[int] | None" = None,
     ) -> torch.cuda.Event | None:
-        """Sync (Phase B): copies happen inline, returns None.
-        Async (Phase C): copies issued on h2d_stream with non_blocking=True;
-        returns an Event the caller waits on before reading the slots.
+        """Make every selected block GPU-resident, returning an H2D Event to
+        wait on (async) or None (sync/aliasing).
+
+        Two-pass, to avoid self-eviction within a single decode step. The arena
+        holds `cap` blocks; a step needs `len(top_ids)` selected blocks plus the
+        blocks in `keep_resident_ids` (the live partial block) simultaneously
+        resident. With the invariant top_k <= cap-1, that set always fits — but
+        a naive single reload loop could, when the arena is full, evict an
+        already-resident block that is ALSO selected this step (or the live
+        block) before it is read.
+
+        Pass 1 touches every already-resident selected block AND every
+        keep_resident_id to MRU, lifting them into the protected (most-recent)
+        end of the LRU. Pass 2 then reloads the CPU-resident misses; because the
+        protected set sits at the MRU end and (selected ∪ keep) <= cap, the LRU
+        victim for each reload is guaranteed to be a NON-protected block. So no
+        block needed this step is evicted before it is gathered.
         """
         ids = logical_block_ids.cpu().tolist()
+        keep = keep_resident_ids or []
         if self.gpu_pool_aliases_kv_cache:
             # Aliasing mode: gpu_k/gpu_v ARE the engine kv_cache; every block
             # is always physically present at its engine paged slot and the
@@ -320,6 +355,14 @@ class TierManager:
                 if (seq_id, bid) in self._slot_map:
                     self._slot_map.get((seq_id, bid))
             return None
+
+        # Pass 1: protect the blocks this step needs that are already resident
+        # (selected-and-resident + the live/keep blocks) by touching them to
+        # MRU. Pure LRU bookkeeping, no data movement.
+        self._touch_resident(seq_id, ids, keep)
+
+        # Pass 2: reload the CPU-resident misses. Their evictions now fall on
+        # non-protected blocks only.
         if self.stream_pool is None:
             if self.enable_event_timing:
                 self._timed_ensure_sync(seq_id, ids)
@@ -332,6 +375,20 @@ class TierManager:
             for bid in ids:
                 self._ensure_one_async(seq_id, bid)
         return self.stream_pool.record_h2d_done()
+
+    def _touch_resident(
+        self, seq_id: int, ids: "list[int]", keep_ids: "list[int]",
+    ) -> None:
+        """Pass 1 of ensure_resident: bump every already-resident block in
+        (ids ∪ keep_ids) to MRU so the Pass-2 reload loop never evicts a block
+        this step still needs. Skips blocks not on GPU (those are reloaded in
+        Pass 2)."""
+        for bid in keep_ids:
+            if (seq_id, bid) in self._slot_map:
+                self._slot_map.get((seq_id, bid))
+        for bid in ids:
+            if (seq_id, bid) in self._slot_map:
+                self._slot_map.get((seq_id, bid))
 
     def _timed_ensure_sync(self, seq_id: int, ids: list[int]) -> None:
         """Benchmark-only: run the sync ensure loop bracketed by cuda Events

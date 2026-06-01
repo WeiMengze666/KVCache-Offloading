@@ -7233,6 +7233,7 @@ class GPUModelRunner(
                     for builder in group.metadata_builders:
                         if isinstance(builder, QuestMetadataBuilder):
                             builder.set_quest_layer_indices(quest_layer_indices)
+                            builder.set_quest_top_k(quest_config.top_k)
 
         if (
             self.speculative_config
