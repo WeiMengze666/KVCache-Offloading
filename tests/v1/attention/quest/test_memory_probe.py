@@ -12,6 +12,12 @@ from benchmarks.quest_memory_probe.configs import (
     expand_oom_sweep,
     expand_pool_size,
 )
+from benchmarks.quest_memory_probe.workload import (
+    Sample,
+    bucket_for_tokens,
+    load_samples_synthetic,  # fallback path; pure Python, no GPU/HF needed
+    parse_spec,
+)
 
 
 class TestRunConfig:
@@ -113,3 +119,68 @@ class TestConfigExpansion:
             pool_sizes=[512, 256, 128],
         )
         assert len({c.name for c in cfgs}) == 3
+
+
+class TestWorkloadParsing:
+    def test_parse_spec_full(self):
+        spec = parse_spec("longbench:narrativeqa:lengths=short,medium:n=2")
+        assert spec.source == "longbench"
+        assert spec.task == "narrativeqa"
+        assert spec.buckets == ("short", "medium")
+        assert spec.n == 2
+
+    def test_parse_spec_single_bucket(self):
+        spec = parse_spec("longbench:lcc:lengths=long:n=1")
+        assert spec.buckets == ("long",)
+        assert spec.n == 1
+
+    def test_parse_spec_rejects_unknown_source(self):
+        with pytest.raises(ValueError, match="unknown workload source"):
+            parse_spec("unknownDS:foo:lengths=short:n=1")
+
+    def test_parse_spec_rejects_bad_bucket(self):
+        with pytest.raises(ValueError, match="unknown length bucket"):
+            parse_spec("longbench:narrativeqa:lengths=tiny:n=1")
+
+
+class TestBucketing:
+    def test_short_bucket(self):
+        assert bucket_for_tokens(2000) == "short"
+
+    def test_medium_bucket(self):
+        assert bucket_for_tokens(8000) == "medium"
+
+    def test_long_bucket(self):
+        assert bucket_for_tokens(20000) == "long"
+
+    def test_xlong_bucket(self):
+        assert bucket_for_tokens(60000) == "xlong"
+
+    def test_boundary_4k_is_medium(self):
+        assert bucket_for_tokens(4096) == "medium"
+
+
+class TestSyntheticFallback:
+    def test_synthetic_returns_n_samples_per_bucket(self):
+        samples = load_samples_synthetic(
+            buckets=("short", "medium"),
+            n=2,
+            seed=42,
+        )
+        assert len(samples) == 4
+        for s in samples:
+            assert isinstance(s, Sample)
+            assert s.bucket in ("short", "medium")
+            assert s.prompt_tokens > 0
+            assert s.prompt
+        # Each (bucket, idx) pair appears exactly once
+        ids = [s.sample_id for s in samples]
+        assert len(set(ids)) == 4
+
+    def test_synthetic_short_is_short(self):
+        samples = load_samples_synthetic(buckets=("short",), n=1, seed=42)
+        assert samples[0].prompt_tokens < 4096
+
+    def test_synthetic_long_is_long(self):
+        samples = load_samples_synthetic(buckets=("long",), n=1, seed=42)
+        assert samples[0].prompt_tokens >= 16384
