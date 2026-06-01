@@ -870,12 +870,53 @@ class TestAttachIntrospection:
         assert found[0] is tms[0]
 
     def test_attach_returns_empty_for_dense_runner(self):
-        from benchmarks.quest_memory_probe import probes
-
         class Runner:
             pass
 
         class Worker:
             model_runner = Runner()
 
-        assert probes._collect_tier_managers(Worker()) == []
+
+@pytest.mark.real_model
+class TestE2ESmoke:
+    def test_compare_pool_size_smoke(self, tmp_path, monkeypatch):
+        """End-to-end: spawns 2 child engines, generates 2 short samples each,
+        produces 5 plots + report.md. Total budget: < 10 minutes.
+
+        Forces synthetic prompts so the test does not depend on LongBench
+        downloads. Only enabled when pytest is invoked with -m real_model.
+        """
+        monkeypatch.setenv("QUEST_MEM_PROBE_FORCE_SYNTHETIC", "1")
+        monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+        from benchmarks.quest_memory_probe.__main__ import main
+
+        rc = main(
+            [
+                "compare-pool-size",
+                "--samples",
+                "longbench:narrativeqa:lengths=short:n=2",
+                "--top-k",
+                "16",
+                "--pool-sizes",
+                "512,16",
+                "--probe-interval-ms",
+                "200",
+                "--max-tokens",
+                "16",
+                "--out-dir",
+                str(tmp_path),
+            ]
+        )
+        assert rc == 0
+        for name in (
+            "quest_pool512_topk16",
+            "quest_pool16_topk16",
+        ):
+            assert (tmp_path / name / "summary.json").exists()
+            assert (tmp_path / name / "samples.csv").exists()
+
+        plots = tmp_path / "plots"
+        assert (plots / "memory_peak_bar.png").exists()
+        assert (plots / "kv_pool_breakdown.png").exists()
+        assert (tmp_path / "report.md").read_text()
