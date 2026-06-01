@@ -280,6 +280,24 @@ class TierManager:
                 self.residency.complete_evict(self.layer_idx, b)
                 self._stats.evict_d2h += 1
 
+    def write_live_block(
+        self, seq_id: int, live_block_id: int,
+        k_block: torch.Tensor, v_block: torch.Tensor,
+    ) -> int:
+        """Copy the live partial block into a (re-touched) arena slot. The live
+        block holds the just-generated decode token; it is never scored, never
+        selected, and must never be evicted while it is the tail — so re-adding
+        it every decode step moves it to MRU and the LRU never picks it.
+        Returns the arena slot.
+        """
+        slot, evicted = self._slot_map.add((seq_id, live_block_id))
+        if evicted is not None:
+            self.spill_hook(*evicted, slot=slot)
+        self.gpu_k[slot].copy_(k_block, non_blocking=False)
+        self.gpu_v[slot].copy_(v_block, non_blocking=False)
+        self.residency.mark_on_gpu(self.layer_idx, live_block_id)
+        return slot
+
     def ensure_resident(
         self,
         seq_id: int,

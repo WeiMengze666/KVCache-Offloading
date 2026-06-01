@@ -65,11 +65,24 @@ def notify_filled_blocks_after_prefill(layer, key, value, md) -> None:
 
 
 def notify_filled_blocks_after_decode(layer, kv_cache, md) -> None:
-    """Single-token decode crosses a block boundary at most once per req.
+    """Decode-step bookkeeping for the Quest arena (Stage 2A).
 
-    The just-finished block has already been written into `kv_cache` by
-    `reshape_and_cache_flash`, so we read the full block back from the
-    physical slot rather than from the 1-token `key`/`value` tensors.
+    Three things happen per request, in order:
+      (a) one-shot trim on the FIRST decode step for the seq — copies the last
+          cap-1 full blocks engine->arena and spills the rest to CPU,
+          establishing the bounded resident set (idempotent per seq);
+      (b) if this token just completed a full block (sl % block_size == 0),
+          register that block's summary + arena slot via on_block_filled;
+      (c) refresh the trailing PARTIAL block into the arena. The partial block
+          holds the just-generated decode token at position sl-1; it is never
+          scored/selected/evicted, but the query must attend it, so it is
+          copied into a pinned arena slot keyed (seq_id, full_blocks) and
+          re-touched (MRU) every step. On the next boundary it becomes a normal
+          full block via (b). When sl % block_size == 0 there is no partial
+          block this step, so (c) is skipped.
+
+    The KV was already written into `kv_cache` by reshape_and_cache_flash, so
+    full/partial blocks are read back from their engine physical slots.
     """
     tm: TierManager | None = getattr(layer, "tier_manager", None)
     if tm is None:
@@ -80,21 +93,27 @@ def notify_filled_blocks_after_decode(layer, kv_cache, md) -> None:
     k_cache_view = kv_cache[:, 0]
     v_cache_view = kv_cache[:, 1]
     for req_idx, sl in enumerate(seq_lens):
-        # Decode sees this token at position sl-1; it just completed the
-        # block iff sl % block_size == 0.
-        if sl == 0 or sl % block_size != 0:
-            continue
-        block_id = sl // block_size - 1
-        # Physical slot of the block we just finished:
-        # block_table[req_idx, block_id] points at the slot reshape_and_cache
-        # wrote into.
-        physical_slot = int(md.block_table[req_idx, block_id].item())
-        tm.on_block_filled(
-            seq_id=req_idx,
-            logical_block_id=block_id,
-            k_block=k_cache_view[physical_slot],
-            v_block=v_cache_view[physical_slot],
+        full_blocks = sl // block_size
+        # (a) one-shot trim on first decode for this seq.
+        tm.trim_to_working_set(
+            seq_id=req_idx, num_full_blocks=full_blocks,
+            kv_cache=kv_cache, block_table_row=md.block_table[req_idx],
         )
+        # (b) a block just completed iff sl % block_size == 0.
+        if sl != 0 and sl % block_size == 0:
+            block_id = sl // block_size - 1
+            phys = int(md.block_table[req_idx, block_id].item())
+            tm.on_block_filled(
+                seq_id=req_idx, logical_block_id=block_id,
+                k_block=k_cache_view[phys], v_block=v_cache_view[phys],
+            )
+        # (c) refresh the live partial block into the arena (if any).
+        if sl % block_size != 0:
+            phys = int(md.block_table[req_idx, full_blocks].item())
+            tm.write_live_block(
+                seq_id=req_idx, live_block_id=full_blocks,
+                k_block=k_cache_view[phys], v_block=v_cache_view[phys],
+            )
 
 
 def _next_quest_layer_idx(layer) -> int | None:

@@ -550,3 +550,126 @@ def test_run_sparse_decode_dispatches_per_selection_impl(
     out = run_sparse_decode(impl, layer, q, kv_cache, md, output)
     assert out is not None
     assert torch.isfinite(out).all(), f"{selection_impl}: non-finite values in output"
+
+
+def _build_arena_path_state(cap, num_full_blocks=6, with_partial=True,
+                            partial_len=128, seed=0):
+    """Stage 2A arena fixture. Like _build_real_path_state but the TierManager
+    has a genuinely BOUNDED private arena (gpu_budget=cap, which may be < the
+    number of logical blocks) and keeps the engine tensor as engine_kv_cache.
+
+    The engine kv_cache is fully populated for every logical block (prefill
+    residency); the arena is NOT pre-populated — the one-shot trim
+    (notify_filled_blocks_after_decode -> trim_to_working_set) establishes it.
+    Block summaries ARE registered for all full blocks so selection can score.
+
+    md.block_table is an identity row: logical block b -> engine slot b. The
+    sequence spans num_full_blocks full blocks plus an optional partial block
+    of `partial_len` tokens (sl = num_full_blocks*block_size + partial_len when
+    with_partial else num_full_blocks*block_size).
+
+    Returns (impl, layer, q, kv_cache, md, output, full_blocks, sl).
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from vllm.v1.attention.backends.quest.cache.block_summary import (
+        BlockSummaryStore,
+    )
+    from vllm.v1.attention.backends.quest.cache.cpu_backing_store import (
+        CpuKvBackingStore,
+    )
+    from vllm.v1.attention.backends.quest.cache.residency import (
+        BlockResidency,
+    )
+    from vllm.v1.attention.backends.quest.cache.tier_manager import (
+        TierManager,
+    )
+
+    torch.manual_seed(seed)
+    block_size = 256
+    num_kv_heads = num_heads = 2
+    head_size = 64
+    full_blocks = num_full_blocks
+    residual = partial_len if with_partial else 0
+    sl = full_blocks * block_size + residual
+    # Engine cache must have a slot for every logical block (full + partial).
+    num_blocks = full_blocks + (1 if with_partial else 0)
+    # __ARENA_HELPER_PART2__
+    kv_cache = torch.randn(
+        num_blocks, 2, block_size, num_kv_heads, head_size,
+        dtype=torch.float16, device="cuda",
+    )
+    k_view = kv_cache[:, 0]
+    summary = BlockSummaryStore(
+        num_layers=1, max_blocks=num_blocks, block_size=block_size,
+        num_kv_heads=num_kv_heads, head_size=head_size,
+        dtype=torch.float16, device="cuda",
+    )
+    # Register summaries for the FULL blocks only (partial cannot be scored).
+    for b in range(full_blocks):
+        summary.on_block_filled(0, b, k_view[b])
+    residency = BlockResidency(num_layers=1, max_blocks=num_blocks)
+    cpu_store = CpuKvBackingStore(
+        num_layers=1, blocks_per_layer=num_blocks, block_size=block_size,
+        num_kv_heads=num_kv_heads, head_size=head_size, dtype=torch.float16,
+    )
+    # Private bounded arena: cap blocks, NOT a view of kv_cache.
+    gpu_k = torch.empty(cap, block_size, num_kv_heads, head_size,
+                        dtype=torch.float16, device="cuda")
+    gpu_v = torch.empty_like(gpu_k)
+    tm = TierManager(
+        layer_idx=0, gpu_budget=cap, gpu_k=gpu_k, gpu_v=gpu_v,
+        summary_store=summary, residency=residency, cpu_store=cpu_store,
+        engine_kv_cache=kv_cache, gpu_pool_aliases_kv_cache=False,
+    )
+
+    layer = MagicMock()
+    layer.layer_idx = 0
+    layer.num_heads = num_heads
+    layer.num_kv_heads = num_kv_heads
+    layer.head_size = head_size
+    layer.scale = 1.0 / (head_size**0.5)
+    layer._k_scale = torch.tensor(1.0, dtype=torch.float16, device="cuda")
+    layer._v_scale = torch.tensor(1.0, dtype=torch.float16, device="cuda")
+    layer.attn_type = "decoder"
+    layer.causal = True
+    layer.tier_manager = tm
+    layer._quest_selection_callable_ref = None
+
+    q = torch.randn(1, num_heads, head_size, dtype=torch.float16, device="cuda")
+    md = SimpleNamespace(
+        num_actual_tokens=1,
+        max_query_len=1,
+        slot_mapping=torch.tensor([sl - 1], dtype=torch.int64, device="cuda"),
+        block_table=torch.arange(
+            num_blocks, dtype=torch.int32, device="cuda",
+        ).unsqueeze(0),
+        seq_lens=torch.tensor([sl], dtype=torch.int32, device="cuda"),
+        max_seq_len=sl,
+        quest_top_k=min(full_blocks, cap - 1),
+        quest_layer_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        sparse_block_table=None,
+    )
+    output = torch.empty(
+        1, num_heads, head_size, dtype=torch.float16, device="cuda",
+    )
+    impl = SimpleNamespace(kv_cache_dtype="auto")
+    return impl, layer, q, kv_cache, md, output, full_blocks, sl
+
+
+def test_decode_live_block_lands_in_arena(cuda):
+    """After a decode step, the live partial block is readable from the arena
+    slot keyed (seq, full_blocks), matching the engine slot; trim fired."""
+    import torch
+    from vllm.v1.attention.backends.quest.impl_helpers import (
+        notify_filled_blocks_after_decode,
+    )
+    impl, layer, q, kv_cache, md, output, full_blocks, sl = \
+        _build_arena_path_state(cap=4, num_full_blocks=6, with_partial=True)
+    tm = layer.tier_manager
+    notify_filled_blocks_after_decode(layer, kv_cache, md)
+    assert getattr(tm, "_trimmed", set())  # trim fired
+    live_slot = tm.logical_to_slot(0, full_blocks)  # the partial block
+    phys = int(md.block_table[0, full_blocks].item())
+    assert torch.equal(tm.gpu_k[live_slot], kv_cache[phys, 0])

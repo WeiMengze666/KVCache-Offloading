@@ -107,9 +107,9 @@ def test_bind_runtime_attaches_tier_manager_using_kv_cache_view(cuda):
     quest_cfg = QuestConfig(
         enabled=True,
         full_kv_layers=[0],
-        # top_k=4: default top_k=64 would fail validation against gpu_cache_blocks_per_seq=4
+        # top_k=3 <= cap-1: default top_k=64 would fail validation against gpu_cache_blocks_per_seq=4
         gpu_cache_blocks_per_seq=4,
-        top_k=4,
+        top_k=3,
         cpu_cache_blocks=4,
     )
     Q = QuestSparseOffloadBackend
@@ -179,9 +179,9 @@ def test_bind_runtime_passes_layers_dict_directly(cuda):
             QuestConfig(
                 enabled=True,
                 full_kv_layers=[0],
-                # top_k=4: default top_k=64 would fail validation against gpu_cache_blocks_per_seq=4
+                # top_k=3 <= cap-1: default top_k=64 would fail validation against gpu_cache_blocks_per_seq=4
                 gpu_cache_blocks_per_seq=4,
-                top_k=4,
+                top_k=3,
                 cpu_cache_blocks=4,
             )
         ),
@@ -211,7 +211,7 @@ def test_bind_runtime_constructs_stream_pool_when_async_enabled(cuda):
         enabled=True,
         full_kv_layers=[0],
         gpu_cache_blocks_per_seq=4,
-        top_k=4,
+        top_k=3,
         cpu_cache_blocks=4,
         enable_async_prefetch=True,
     )
@@ -255,7 +255,7 @@ def test_bind_runtime_no_stream_pool_when_async_disabled(cuda):
         enabled=True,
         full_kv_layers=[0],
         gpu_cache_blocks_per_seq=4,
-        top_k=4,
+        top_k=3,
         cpu_cache_blocks=4,
         # enable_async_prefetch defaults to False
     )
@@ -294,7 +294,7 @@ def test_bind_runtime_attaches_quest_refs_to_layers(cuda):
         enabled=True,
         full_kv_layers=[0],
         gpu_cache_blocks_per_seq=4,
-        top_k=4,
+        top_k=3,
         cpu_cache_blocks=4,
         enable_async_prefetch=True,
         prefetch_window_blocks=2,
@@ -346,7 +346,7 @@ def test_bind_runtime_does_not_attach_refs_when_async_disabled(cuda):
         enabled=True,
         full_kv_layers=[0],
         gpu_cache_blocks_per_seq=4,
-        top_k=4,
+        top_k=3,
         cpu_cache_blocks=4,
         # async off → sync path, no Mode 2 plumbing
     )

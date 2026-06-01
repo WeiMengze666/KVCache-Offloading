@@ -63,6 +63,21 @@ def test_top_k_exceeds_gpu_budget_rejected():
     assert any("gpu_cache_blocks_per_seq" in e for e in errors)
 
 
+def test_validate_rejects_top_k_equal_to_cap():
+    """One arena slot is reserved for the live decode block, so top_k must be
+    <= gpu_cache_blocks_per_seq - 1."""
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+
+    errors = QuestSparseOffloadBackend.validate_quest_configuration(
+        model_config=_model_config(),
+        cache_config=SimpleNamespace(block_size=256),
+        quest_config=_quest_cfg(top_k=8, gpu_cache_blocks_per_seq=8),
+    )
+    assert any("reserved for the live decode block" in e for e in errors)
+
+
 def test_unknown_architecture_in_error_mode():
     from vllm.v1.attention.backends.quest.backend import (
         QuestSparseOffloadBackend,

@@ -158,11 +158,12 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 "block_size % 256 == 0. Set --block-size 256 or larger."
             )
 
-        if quest_config.top_k > quest_config.gpu_cache_blocks_per_seq:
+        if quest_config.top_k > quest_config.gpu_cache_blocks_per_seq - 1:
             errors.append(
-                f"top_k ({quest_config.top_k}) > gpu_cache_blocks_per_seq "
-                f"({quest_config.gpu_cache_blocks_per_seq}); the working set "
-                "must fit the selected blocks."
+                f"top_k ({quest_config.top_k}) must be <= "
+                f"gpu_cache_blocks_per_seq - 1 "
+                f"({quest_config.gpu_cache_blocks_per_seq - 1}); one arena slot "
+                "is reserved for the live decode block."
             )
 
         compat = check_model_compat(model_config)
