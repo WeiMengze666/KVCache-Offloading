@@ -184,3 +184,25 @@ class TestSyntheticFallback:
     def test_synthetic_long_is_long(self):
         samples = load_samples_synthetic(buckets=("long",), n=1, seed=42)
         assert samples[0].prompt_tokens >= 16384
+
+
+class TestLongBenchLoader:
+    def test_load_samples_dispatch_synthetic_when_disabled(self, monkeypatch):
+        # Force the loader to skip LongBench and use the synthetic fallback.
+        from benchmarks.quest_memory_probe import workload
+
+        monkeypatch.setenv("QUEST_MEM_PROBE_FORCE_SYNTHETIC", "1")
+        samples = workload.load_samples("longbench:narrativeqa:lengths=short:n=2")
+        assert len(samples) == 2
+        assert all(s.sample_id.startswith("synthetic/") for s in samples)
+
+    def test_load_samples_falls_back_on_load_dataset_error(self, monkeypatch):
+        from benchmarks.quest_memory_probe import workload
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated dataset load failure")
+
+        monkeypatch.setattr(workload, "_load_dataset", boom)
+        samples = workload.load_samples("longbench:narrativeqa:lengths=short:n=1")
+        assert len(samples) == 1
+        assert samples[0].sample_id.startswith("synthetic/")

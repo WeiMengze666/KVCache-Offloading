@@ -10,8 +10,11 @@ which path was used so the report makes it explicit.
 
 from __future__ import annotations
 
+import os
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 # Length buckets (token counts after tokenization).
 _BUCKET_BOUNDARIES = {
@@ -155,4 +158,110 @@ def load_samples_synthetic(
                     bucket=bucket,
                 )
             )
+    return out
+
+
+def _load_dataset(name: str, split: str):
+    """Indirection for monkeypatching in tests."""
+    from datasets import load_dataset
+
+    return load_dataset(name, split=split)
+
+
+def _read_template(name: str) -> str:
+    longbench_dir = Path("/home/yijun/offload_attn/LongBench/prompts")
+    return (longbench_dir / name).read_text(encoding="utf-8")
+
+
+def _build_longbench_prompt(item: dict, template: str) -> str:
+    """Mirror pred_quest_vllm.build_prompt without re-importing it (avoid
+    pulling vllm into a no-GPU test path). Substitutes context, question,
+    and four choices into the template."""
+    return (
+        template.replace("$DOC$", item.get("context", ""))
+        .replace("$Q$", item.get("question", ""))
+        .replace("$C_A$", item.get("choice_A", ""))
+        .replace("$C_B$", item.get("choice_B", ""))
+        .replace("$C_C$", item.get("choice_C", ""))
+        .replace("$C_D$", item.get("choice_D", ""))
+    )
+
+
+def _tokenize_count(prompt: str, model: str) -> int:
+    """Lazy tokenizer load — only when LongBench path is actually used."""
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    return len(tok(prompt, add_special_tokens=False)["input_ids"])
+
+
+def load_samples(
+    spec_str: str,
+    *,
+    model: str = "meta-llama/Llama-3.2-3B-Instruct",
+) -> list[Sample]:
+    """Top-level entry. Tries LongBench, falls back to synthetic.
+
+    QUEST_MEM_PROBE_FORCE_SYNTHETIC=1 in the env forces the fallback path
+    (handy for unit tests and for cluster runs without HF Hub access).
+    """
+    spec = parse_spec(spec_str)
+    if os.environ.get("QUEST_MEM_PROBE_FORCE_SYNTHETIC") == "1":
+        print("[quest_memory_probe] forced synthetic workload", file=sys.stderr)
+        return load_samples_synthetic(buckets=spec.buckets, n=spec.n)
+    try:
+        return _load_samples_longbench(spec, model=model)
+    except Exception as e:
+        print(
+            f"[quest_memory_probe] WARN LongBench load failed ({e!r}); "
+            "falling back to synthetic prompts",
+            file=sys.stderr,
+        )
+        return load_samples_synthetic(buckets=spec.buckets, n=spec.n)
+
+
+def _load_samples_longbench(
+    spec: WorkloadSpec,
+    *,
+    model: str,
+) -> list[Sample]:
+    template = _read_template("0shot.txt")
+    ds = _load_dataset("THUDM/LongBench-v2", split="train")
+    # Filter by task domain. LongBench-v2 uses 'domain' / 'sub_domain'; if
+    # spec.task doesn't match exact domain, fall back to including everything.
+    items = [it for it in ds if it.get("domain") == spec.task]
+    if not items:
+        items = list(ds)
+
+    # Render + tokenize. We do NOT keep all items in memory — bucket as we go.
+    by_bucket: dict[str, list[Sample]] = {b: [] for b in spec.buckets}
+    for idx, item in enumerate(items):
+        if all(len(v) >= spec.n for v in by_bucket.values()):
+            break
+        prompt = _build_longbench_prompt(item, template)
+        tokens = _tokenize_count(prompt, model=model)
+        try:
+            bucket = bucket_for_tokens(tokens)
+        except ValueError:
+            continue
+        if bucket not in by_bucket or len(by_bucket[bucket]) >= spec.n:
+            continue
+        by_bucket[bucket].append(
+            Sample(
+                sample_id=f"longbench/{spec.task}/{bucket}/{idx}",
+                prompt=prompt,
+                prompt_tokens=tokens,
+                bucket=bucket,
+            )
+        )
+
+    out: list[Sample] = []
+    for bucket in spec.buckets:
+        if len(by_bucket[bucket]) < spec.n:
+            raise RuntimeError(
+                f"LongBench produced only {len(by_bucket[bucket])}/{spec.n} "
+                f"samples for bucket={bucket!r} (task={spec.task!r}); "
+                "spec is too tight for this dataset."
+            )
+        out.extend(by_bucket[bucket])
     return out
