@@ -140,6 +140,9 @@ class TierManager:
         self._stats = QuestStats()
         # Debug-only per-(step, seq) selected block-id log (overlap capture).
         self._selected_log: list[dict] = []
+        # seq_ids that have already had their one-shot prefill->decode trim
+        # (trim_to_working_set). Trim is idempotent per sequence.
+        self._trimmed: set[int] = set()
         # Pluggable D2H spill seam. Default = the synchronous _spill_to_cpu
         # defined below. Stage 2B write-through overrides this to mirror blocks
         # to host on a d2h_stream at fill time instead of at eviction time.
@@ -229,6 +232,53 @@ class TierManager:
         self.residency.mark_on_gpu(self.layer_idx, logical_block_id)
         self._stats.block_filled += 1
         return slot
+
+    def trim_to_working_set(
+        self, seq_id: int, num_full_blocks: int, kv_cache: torch.Tensor,
+        block_table_row,
+    ) -> None:
+        """One-shot prefill->decode trim. Keep the last cap-1 full blocks in
+        the arena (1 slot reserved for the live decode block), spill the rest
+        to CPU. Idempotent per seq.
+
+        kv_cache is the engine tensor (FA layout (nb, 2, bs, h, d));
+        block_table_row[b] is the engine physical slot for logical block b of
+        this sequence. Kept blocks are copied engine->arena; spilled blocks are
+        copied engine->CPU and recorded in _cpu_slots so ensure_resident can
+        reload them (H2D) when later selected.
+        """
+        if seq_id in self._trimmed:
+            return
+        self._trimmed.add(seq_id)
+        keep_n = max(0, min(num_full_blocks, self._slot_map.capacity - 1))
+        keep_lo = num_full_blocks - keep_n  # keep [keep_lo, num_full_blocks)
+        k_eng, v_eng = kv_cache[:, 0], kv_cache[:, 1]
+        for b in range(num_full_blocks):
+            phys = int(block_table_row[b])
+            if b >= keep_lo:
+                slot, evicted = self._slot_map.add((seq_id, b))
+                assert evicted is None, "trim must not overflow the arena"
+                self.gpu_k[slot].copy_(k_eng[phys])
+                self.gpu_v[slot].copy_(v_eng[phys])
+                self.residency.mark_on_gpu(self.layer_idx, b)
+            else:
+                try:
+                    cpu_slot = self.cpu_store.alloc(self.layer_idx)
+                except RuntimeError as e:
+                    raise RuntimeError(
+                        f"Quest trim: CPU pool exhausted spilling "
+                        f"{num_full_blocks - keep_n} blocks for seq {seq_id} "
+                        f"layer {self.layer_idx}; raise cpu_cache_blocks or use "
+                        f"a shorter prompt (Stage 2B adds max_model_len-based "
+                        f"sizing)"
+                    ) from e
+                self.cpu_store.store_block(
+                    self.layer_idx, cpu_slot, k_eng[phys], v_eng[phys],
+                )
+                self._cpu_slots[(seq_id, b)] = cpu_slot
+                self.residency.begin_evict(self.layer_idx, b)
+                self.residency.complete_evict(self.layer_idx, b)
+                self._stats.evict_d2h += 1
 
     def ensure_resident(
         self,
