@@ -277,3 +277,21 @@ def test_event_timing_skips_h2d_when_all_resident():
     assert s.load_h2d == 0
     assert s.h2d_wait_events == 0
     assert s.h2d_wait_ms == 0.0
+
+
+def test_overlap_capture_records_selected_sets_when_enabled():
+    tm = _build(gpu_budget=8, enable_overlap_capture=True)
+    tm.record_selected(step=0, seq_id=0, block_ids=[1, 2, 3])
+    tm.record_selected(step=0, seq_id=1, block_ids=[2, 3, 4])
+    buf = tm.drain_selected()
+    assert buf == [
+        {"step": 0, "seq_id": 0, "block_ids": [1, 2, 3]},
+        {"step": 0, "seq_id": 1, "block_ids": [2, 3, 4]},
+    ]
+    assert tm.drain_selected() == []  # drained
+
+
+def test_overlap_capture_noop_when_disabled():
+    tm = _build(gpu_budget=8, enable_overlap_capture=False)
+    tm.record_selected(step=0, seq_id=0, block_ids=[1, 2, 3])
+    assert tm.drain_selected() == []

@@ -318,6 +318,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 cpu_store=cpu_store,
                 stream_pool=stream_pool,
                 enable_event_timing=quest_config.enable_debug_counters,
+                enable_overlap_capture=quest_config.enable_debug_counters,
                 gpu_pool_aliases_kv_cache=pool_aliases_kv_cache,
             )
             layer._quest_selection_callable_ref = selection_callable

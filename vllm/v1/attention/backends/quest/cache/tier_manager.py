@@ -95,6 +95,7 @@ class TierManager:
         cpu_store: CpuKvBackingStore,
         stream_pool: QuestStreamPool | None = None,
         enable_event_timing: bool = False,
+        enable_overlap_capture: bool = False,
         gpu_pool_aliases_kv_cache: bool = False,
     ) -> None:
         self.layer_idx = layer_idx
@@ -120,14 +121,40 @@ class TierManager:
         # _stats. Zero-cost when False (no Event creation, no sync). Gated by
         # QuestConfig.enable_debug_counters at construction time.
         self.enable_event_timing = enable_event_timing
+        # Benchmark/debug-only (Stage 1 cross-layer overlap): when True,
+        # run_sparse_decode records each step's selected block-id set into
+        # _selected_log via record_selected. Drained out-of-band by the
+        # apply_model probe after the run. No-op when False (record_selected
+        # returns immediately). Gated by QuestConfig.enable_debug_counters at
+        # construction time, same gate as enable_event_timing.
+        self.enable_overlap_capture = enable_overlap_capture
 
         self._slot_map = _LRUSlotMap(capacity=gpu_budget)
         # Per-evicted (seq_id, logical_block_id) -> cpu_slot
         self._cpu_slots: dict[tuple[int, int], int] = {}
         self._stats = QuestStats()
+        # Debug-only per-(step, seq) selected block-id log (overlap capture).
+        self._selected_log: list[dict] = []
 
     def stats(self) -> QuestStats:
         return self._stats
+
+    def record_selected(self, step: int, seq_id: int, block_ids) -> None:
+        """Debug-only (Stage 1 cross-layer overlap). Append this step's selected
+        block ids for this (layer-slot, step, seq). No-op unless capture is on.
+        Cheap: a list of small int lists; drained via apply_model after the run.
+        """
+        if not self.enable_overlap_capture:
+            return
+        self._selected_log.append({
+            "step": int(step), "seq_id": int(seq_id),
+            "block_ids": [int(b) for b in block_ids],
+        })
+
+    def drain_selected(self) -> list[dict]:
+        out = self._selected_log
+        self._selected_log = []
+        return out
 
     def logical_to_slot(self, seq_id: int, logical_block_id: int) -> int:
         return self._slot_map.get((seq_id, logical_block_id))

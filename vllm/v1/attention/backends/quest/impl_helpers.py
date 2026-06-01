@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 
 import torch
@@ -12,6 +13,22 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.quest.cache.tier_manager import (
         TierManager,
     )
+
+
+@contextlib.contextmanager
+def _nvtx_range(name: str, enabled: bool):
+    """NVTX range, no-op unless enabled (clean pass / default path stay clean).
+    torch.cuda.nvtx is always importable; range_push/pop are ~free but we still
+    gate so the clean perf pass has zero added calls."""
+    if not enabled:
+        yield
+        return
+    import torch
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 def notify_filled_blocks_after_prefill(layer, key, value, md) -> None:
@@ -178,14 +195,25 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         # summary_store is sized num_quest_layers, so indexing by global
         # layer_idx (2..27) overflows.
         summary_layer = tm.summary_store.summary[tm.layer_idx]
-        top_ids = selection_fn(
-            query=q_token.reshape(layer.num_heads, layer.head_size),
-            block_summary=summary_layer,
-            candidate_ids=cand,
-            num_kv_groups=layer.num_heads // layer.num_kv_heads,
-            top_k=min(top_k, full_blocks),
-        )
+        # Debug gate: NVTX ranges only when overlap/debug capture is on
+        # (instrumented pass). Default path / clean pass add zero NVTX calls.
+        nvtx_gate = getattr(tm, "enable_overlap_capture", False)
+        with _nvtx_range(f"quest.select.L{tm.layer_idx}", nvtx_gate):
+            top_ids = selection_fn(
+                query=q_token.reshape(layer.num_heads, layer.head_size),
+                block_summary=summary_layer,
+                candidate_ids=cand,
+                num_kv_groups=layer.num_heads // layer.num_kv_heads,
+                top_k=min(top_k, full_blocks),
+            )
         per_req_top_ids.append(top_ids)
+        if tm_stats is not None and getattr(tm, "enable_overlap_capture", False):
+            # step = this layer's select_calls-1 (0-based); seq_id = req_idx.
+            tm.record_selected(
+                step=tm_stats._stats.select_calls - 1,
+                seq_id=req_idx,
+                block_ids=top_ids.tolist(),
+            )
         if tm_stats is not None:
             tm_stats._stats.selected_total += int(top_ids.numel())
             # GPU-residency hit-rate numerator: how many of the just-selected
@@ -200,12 +228,13 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         # Wait on H2D completion before kernel reads the slots. Sync mode
         # returns None (no wait); async mode returns an Event we must
         # serialize the compute stream against.
-        h2d_event = tm.ensure_resident(
-            seq_id=req_idx,
-            logical_block_ids=top_ids,
-        )
-        if h2d_event is not None:
-            torch.cuda.current_stream().wait_event(h2d_event)
+        with _nvtx_range(f"quest.ensure_resident.L{tm.layer_idx}", nvtx_gate):
+            h2d_event = tm.ensure_resident(
+                seq_id=req_idx,
+                logical_block_ids=top_ids,
+            )
+            if h2d_event is not None:
+                torch.cuda.current_stream().wait_event(h2d_event)
         # Translate selected logical block ids to PHYSICAL kv_cache rows.
         #
         # init_runtime_state binds tm.gpu_k/gpu_v as ZERO-COPY views of the
@@ -258,14 +287,15 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         # kv_cache layout (num_blocks, 2, block_size, h_kv, head_size)
         k_view = kv_cache[:, 0]
         v_view = kv_cache[:, 1]
-        out_req = flash_attn_with_kvcache(
-            query[req_idx : req_idx + 1].unsqueeze(1),
-            k_view,
-            v_view,
-            block_table=slots,
-            cache_seqlens=sub_seq_len,
-            causal=True,
-        )
+        with _nvtx_range(f"quest.sparse_attn.L{tm.layer_idx}", nvtx_gate):
+            out_req = flash_attn_with_kvcache(
+                query[req_idx : req_idx + 1].unsqueeze(1),
+                k_view,
+                v_view,
+                block_table=slots,
+                cache_seqlens=sub_seq_len,
+                causal=True,
+            )
         out_chunks.append(out_req.squeeze(1))
 
     out = torch.cat(out_chunks, dim=0)
