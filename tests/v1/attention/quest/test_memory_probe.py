@@ -584,3 +584,51 @@ class TestSummary:
         out = aggregate_samples(rows)
         assert len(out) == 1
         assert out[0]["peak_nvml_used_bytes"] == 100
+
+
+class TestRunnerHelpers:
+    def test_make_quest_engine_kwargs_dense(self):
+        from benchmarks.quest_memory_probe.configs import RunConfig
+        from benchmarks.quest_memory_probe.runner import (
+            _make_engine_kwargs,
+        )
+
+        cfg = RunConfig(name="dense", quest_enabled=False)
+        kw = _make_engine_kwargs(cfg, quest_json_path=None)
+        assert kw["model"] == cfg.model
+        assert kw["block_size"] == 256
+        assert kw["enforce_eager"] is True
+        assert kw["enable_prefix_caching"] is False
+        assert kw["enable_chunked_prefill"] is False
+        assert "enable_quest_sparse_offload" not in kw
+
+    def test_make_quest_engine_kwargs_quest(self, tmp_path):
+        from benchmarks.quest_memory_probe.configs import RunConfig
+        from benchmarks.quest_memory_probe.runner import (
+            _make_engine_kwargs,
+        )
+
+        cfg = RunConfig(
+            name="q",
+            quest_enabled=True,
+            top_k=16,
+            gpu_cache_blocks_per_seq=128,
+        )
+        json_path = tmp_path / "q.json"
+        json_path.write_text("{}")
+        kw = _make_engine_kwargs(cfg, quest_json_path=str(json_path))
+        assert kw["enable_quest_sparse_offload"] is True
+        assert kw["quest_config"] == str(json_path)
+
+
+class TestRunnerOomDetection:
+    def test_is_oom_error_matches_runtime_message(self):
+        from benchmarks.quest_memory_probe.runner import _is_oom_error
+
+        err = RuntimeError("CUDA out of memory. Tried to allocate ...")
+        assert _is_oom_error(err)
+
+    def test_is_oom_error_rejects_other(self):
+        from benchmarks.quest_memory_probe.runner import _is_oom_error
+
+        assert not _is_oom_error(ValueError("nope"))
