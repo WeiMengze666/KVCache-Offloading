@@ -458,3 +458,129 @@ class TestCsvWriter:
         out = tmp_path / "empty.csv"
         write_rows(out, [])
         assert not out.exists()
+
+
+class TestSummary:
+    def test_aggregate_per_sample(self):
+        from benchmarks.quest_memory_probe.summary import aggregate_samples
+
+        rows = [
+            {
+                "ts_ms": 0,
+                "phase": "sample_start",
+                "sample_id": "s0",
+                "prompt_tokens": 1000,
+            },
+            {
+                "ts_ms": 1,
+                "phase": "sampling",
+                "nvml.gpu_used_bytes": 100,
+                "torch.allocated_bytes": 80,
+                "vllm.gpu_kv_useful_bytes": 30,
+                "vllm.kv_pool_slack_bytes": 70,
+                "quest.topk_hit_ratio": 0.8,
+            },
+            {
+                "ts_ms": 2,
+                "phase": "sampling",
+                "nvml.gpu_used_bytes": 120,
+                "torch.allocated_bytes": 90,
+                "vllm.gpu_kv_useful_bytes": 40,
+                "vllm.kv_pool_slack_bytes": 60,
+                "quest.topk_hit_ratio": 0.9,
+            },
+            {
+                "ts_ms": 3,
+                "phase": "sampling",
+                "nvml.gpu_used_bytes": 110,
+                "torch.allocated_bytes": 85,
+                "vllm.gpu_kv_useful_bytes": 35,
+                "vllm.kv_pool_slack_bytes": 65,
+                "quest.topk_hit_ratio": 0.85,
+            },
+            {
+                "ts_ms": 4,
+                "phase": "sample_end",
+                "sample_id": "s0",
+                "gen_tokens": 64,
+                "latency_s": 4.0,
+            },
+            {
+                "ts_ms": 5,
+                "phase": "sample_start",
+                "sample_id": "s1",
+                "prompt_tokens": 50000,
+            },
+            {"ts_ms": 6, "phase": "oom_at_sample", "sample_id": "s1"},
+        ]
+        per_sample = aggregate_samples(rows)
+        assert len(per_sample) == 2
+        s0 = per_sample[0]
+        assert s0["sample_id"] == "s0"
+        assert s0["prompt_tokens"] == 1000
+        assert s0["gen_tokens"] == 64
+        assert s0["oom"] is False
+        assert s0["peak_nvml_used_bytes"] == 120
+        assert s0["peak_torch_allocated_bytes"] == 90
+        assert s0["peak_kv_useful_bytes"] == 40
+        # median of slack [70, 60, 65] = 65
+        assert s0["mean_kv_slack_bytes"] == pytest.approx(65)
+        assert s0["mean_topk_hit_ratio"] == pytest.approx(0.85)
+
+        s1 = per_sample[1]
+        assert s1["sample_id"] == "s1"
+        assert s1["oom"] is True
+        # OOM samples report whatever sampling rows accumulated (none here)
+        assert s1["peak_nvml_used_bytes"] == 0
+
+    def test_aggregate_handles_no_sampling_rows(self):
+        from benchmarks.quest_memory_probe.summary import aggregate_samples
+
+        rows = [
+            {
+                "ts_ms": 0,
+                "phase": "sample_start",
+                "sample_id": "x",
+                "prompt_tokens": 100,
+            },
+            {
+                "ts_ms": 1,
+                "phase": "sample_end",
+                "sample_id": "x",
+                "gen_tokens": 16,
+                "latency_s": 0.5,
+            },
+        ]
+        out = aggregate_samples(rows)
+        assert len(out) == 1
+        assert out[0]["peak_nvml_used_bytes"] == 0
+        assert out[0]["mean_topk_hit_ratio"] is None
+
+    def test_aggregate_skips_pre_engine_init_rows(self):
+        from benchmarks.quest_memory_probe.summary import aggregate_samples
+
+        rows = [
+            {"ts_ms": 0, "phase": "engine_init_done"},
+            {
+                "ts_ms": 1,
+                "phase": "sampling",
+                "nvml.gpu_used_bytes": 50,
+            },  # before any sample_start; ignored
+            {
+                "ts_ms": 2,
+                "phase": "sample_start",
+                "sample_id": "x",
+                "prompt_tokens": 100,
+            },
+            {"ts_ms": 3, "phase": "sampling", "nvml.gpu_used_bytes": 100},
+            {
+                "ts_ms": 4,
+                "phase": "sample_end",
+                "sample_id": "x",
+                "gen_tokens": 16,
+                "latency_s": 0.5,
+            },
+        ]
+        out = aggregate_samples(rows)
+        assert len(out) == 1
+        assert out[0]["peak_nvml_used_bytes"] == 100
