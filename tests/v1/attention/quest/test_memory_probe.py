@@ -386,3 +386,75 @@ class TestSampler:
         s.stop()  # second stop must not raise
         s.join(timeout=1.0)
         assert not s.is_alive()
+
+
+class TestCsvWriter:
+    def test_writes_union_of_keys(self, tmp_path):
+        from benchmarks.quest_memory_probe.csv_writer import write_rows
+
+        rows = [
+            {
+                "ts_ms": 1,
+                "phase": "sampling",
+                "torch.allocated_bytes": 100,
+                "quest.gpu_resident_blocks": 5,
+            },
+            {
+                "ts_ms": 2,
+                "phase": "sample_end",
+                "sample_id": "synthetic/short/0",
+                "prompt_tokens": 2048,
+                "gen_tokens": 64,
+                "latency_s": 1.23,
+            },
+        ]
+        out = tmp_path / "samples.csv"
+        write_rows(out, rows)
+
+        text = out.read_text()
+        header = text.splitlines()[0].split(",")
+        for k in (
+            "ts_ms",
+            "phase",
+            "torch.allocated_bytes",
+            "quest.gpu_resident_blocks",
+            "sample_id",
+            "prompt_tokens",
+            "gen_tokens",
+            "latency_s",
+        ):
+            assert k in header
+
+    def test_missing_fields_become_empty(self, tmp_path):
+        from benchmarks.quest_memory_probe.csv_writer import write_rows
+
+        rows = [
+            {"ts_ms": 1, "phase": "sampling", "torch.allocated_bytes": 100},
+            {"ts_ms": 2, "phase": "sampling", "torch.reserved_bytes": 200},
+        ]
+        out = tmp_path / "x.csv"
+        write_rows(out, rows)
+        lines = out.read_text().splitlines()
+        assert len(lines) == 3
+        header = lines[0].split(",")
+        i_alloc = header.index("torch.allocated_bytes")
+        cells = lines[2].split(",")
+        assert cells[i_alloc] == ""
+
+    def test_none_serialized_as_empty(self, tmp_path):
+        from benchmarks.quest_memory_probe.csv_writer import write_rows
+
+        rows = [{"ts_ms": 1, "phase": "sampling", "quest.topk_hit_ratio": None}]
+        out = tmp_path / "x.csv"
+        write_rows(out, rows)
+        lines = out.read_text().splitlines()
+        header = lines[0].split(",")
+        i = header.index("quest.topk_hit_ratio")
+        assert lines[1].split(",")[i] == ""
+
+    def test_empty_rows_writes_no_file(self, tmp_path):
+        from benchmarks.quest_memory_probe.csv_writer import write_rows
+
+        out = tmp_path / "empty.csv"
+        write_rows(out, [])
+        assert not out.exists()
