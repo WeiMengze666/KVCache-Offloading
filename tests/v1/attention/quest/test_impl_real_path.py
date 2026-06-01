@@ -742,3 +742,62 @@ def test_arena_decode_reads_arena_not_engine(cuda):
     run_sparse_decode(impl, layer, q, kv_cache, md, output)
     assert torch.allclose(output, dense.reshape_as(output), atol=2e-3, rtol=2e-3), \
         "decode must gather from the arena, not the clobbered engine cache"
+
+
+def test_partial_block_unscored_pinned_and_transitions(cuda):
+    """Stage A+B: the live partial block is never a selection candidate, stays
+    arena-resident (pinned) under eviction pressure, and converts to a normal
+    full block on the next boundary without leaking an arena slot."""
+    import torch
+    from vllm.v1.attention.backends.quest.impl_helpers import (
+        notify_filled_blocks_after_decode, run_sparse_decode,
+    )
+    # cap small so eviction pressure exists; sl just past a boundary (partial=1).
+    impl, layer, q, kv_cache, md, output, fb, sl = _build_arena_path_state(
+        cap=4, num_full_blocks=5, with_partial=True, partial_len=1, seed=0)
+    tm = layer.tier_manager
+    md.quest_top_k = 3  # top_k <= cap-1
+    notify_filled_blocks_after_decode(layer, kv_cache, md)
+    # (A) the partial block id == fb is NOT scored: on_block_filled (which bumps
+    #     block_filled) fires only for FULL blocks, never for the live partial.
+    bf_before = tm.stats().block_filled
+    # (B) the live block is resident and pinned: a decode step that selects and
+    #     reloads other blocks must not evict it.
+    run_sparse_decode(impl, layer, q, kv_cache, md, output)
+    assert tm.is_resident(0, fb), "live partial block must stay arena-resident"
+    # (C) transition: advance sl to the next boundary; the (now-full) block fb
+    #     gets a summary via on_block_filled and keeps its single arena slot.
+    md.seq_lens = torch.tensor([(fb + 1) * tm.gpu_k.shape[1]],
+                               device=md.seq_lens.device, dtype=md.seq_lens.dtype)
+    notify_filled_blocks_after_decode(layer, kv_cache, md)
+    assert tm.stats().block_filled == bf_before + 1, "fb should fill exactly once"
+    # the key (0, fb) maps to exactly one arena slot (no double-occupancy)
+    keys_for_fb = [k for k in tm._slot_map._key_to_slot if k == (0, fb)]
+    assert len(keys_for_fb) == 1
+
+
+@pytest.mark.parametrize("extra_tokens", [0, 1, 128])
+def test_partial_block_attention_use_matches_dense(cuda, extra_tokens):
+    """Stage C: sl = N*block_size + extra_tokens. extra=0 (no partial),
+    1 (minimal), 128 (mid). Arena large (no overflow), top_k >= full_blocks so
+    select-all == dense. Verifies gather order + cache_seqlens math."""
+    import torch
+    from flash_attn import flash_attn_with_kvcache
+    from vllm.v1.attention.backends.quest.impl_helpers import (
+        notify_filled_blocks_after_decode, run_sparse_decode,
+    )
+    full_blocks = 3
+    impl, layer, q, kv_cache, md, output, fb, sl = _build_arena_path_state(
+        cap=8, num_full_blocks=full_blocks, with_partial=(extra_tokens > 0),
+        partial_len=extra_tokens, seed=0)
+    md.quest_top_k = full_blocks  # select all -> ==dense valid
+    n_gather = full_blocks + (1 if extra_tokens > 0 else 0)
+    bt = md.block_table[0, :n_gather].to(torch.int32).unsqueeze(0)
+    cs = torch.tensor([sl], dtype=torch.int32, device="cuda")
+    dense = flash_attn_with_kvcache(q[0:1].unsqueeze(1), kv_cache[:, 0],
+                                    kv_cache[:, 1], block_table=bt,
+                                    cache_seqlens=cs, causal=True).squeeze(1)
+    notify_filled_blocks_after_decode(layer, kv_cache, md)
+    run_sparse_decode(impl, layer, q, kv_cache, md, output)
+    assert torch.allclose(output, dense.reshape_as(output), atol=2e-3, rtol=2e-3), \
+        f"attention-use mismatch at extra_tokens={extra_tokens}"

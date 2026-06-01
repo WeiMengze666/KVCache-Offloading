@@ -267,10 +267,23 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         ]
         # Number of FULL blocks actually gathered (top_k may be < full_blocks).
         num_full_gathered = len(slot_list)
-        # ALWAYS append the trailing partial block (the live decode token).
-        # notify_filled_blocks_after_decode copied it into a pinned arena slot
-        # keyed (req_idx, full_blocks) via write_live_block, so it is read from
-        # the arena too. Never scored, never selected, never evicted.
+        # Trailing PARTIAL block lifecycle (Stages A/B/C — see Task 5b):
+        #  A (management): the partial block holds the live decode token at
+        #    position sl-1. It has NO summary and is NOT a selection candidate
+        #    (cand = arange(full_blocks) excludes it), so it is never scored,
+        #    selected, or evicted.
+        #  B (caching): write_live_block copied it from its engine slot into a
+        #    PINNED arena slot keyed (req_idx, full_blocks), re-touched to MRU
+        #    every step so the LRU never picks it. On the next boundary it
+        #    becomes a normal full block via on_block_filled (same key, same
+        #    arena slot — no double-occupancy).
+        #  C (attention use): it is appended LAST, after the num_full_gathered
+        #    selected blocks, so its tokens occupy gather positions
+        #    [num_full_gathered*bs, num_full_gathered*bs + residual); cache_seqlens
+        #    = sl_effective bounds the read to exactly those live tokens, so the
+        #    unwritten tail (residual..bs-1) and anything past it are never read.
+        #  Exact boundary (sl % bs == 0): has_partial is False, nothing is
+        #    appended, residual = 0 — full-blocks-only gather.
         if has_partial:
             slot_list.append(
                 tm.logical_to_slot(seq_id=req_idx, logical_block_id=full_blocks)
