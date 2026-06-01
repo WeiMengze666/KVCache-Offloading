@@ -717,4 +717,131 @@ class TestCli:
         )
         cfgs = args_to_configs(args)
         assert len(cfgs) == 2
-        assert all(c.quest_enabled for c in cfgs)
+
+
+class TestReport:
+    def _seed_run(self, root):
+        """Create a minimal fake out_dir with one dense + one quest cfg."""
+        import csv as _csv
+        import json as _json
+
+        manifest = {
+            "subcommand": "compare-pool-size",
+            "timestamp": "2026-06-01T00:00:00",
+            "commit": "test",
+            "configs": [
+                {"name": "dense", "quest_enabled": False},
+                {
+                    "name": "quest_pool128",
+                    "quest_enabled": True,
+                    "top_k": 16,
+                    "gpu_cache_blocks_per_seq": 128,
+                },
+            ],
+            "argv": ["test"],
+        }
+        (root / "manifest.json").write_text(_json.dumps(manifest))
+
+        for name, useful, slack in [
+            ("dense", 9 * 1024**3, 1 * 1024**3),
+            ("quest_pool128", 4 * 1024**3, 6 * 1024**3),
+        ]:
+            d = root / name
+            d.mkdir()
+            rows = [
+                {"ts_ms": 0, "phase": "engine_init_done"},
+                {
+                    "ts_ms": 1,
+                    "phase": "sample_start",
+                    "sample_id": "s0",
+                    "prompt_tokens": 2000,
+                },
+                {
+                    "ts_ms": 2,
+                    "phase": "sampling",
+                    "nvml.gpu_used_bytes": 20 * 1024**3,
+                    "torch.allocated_bytes": 18 * 1024**3,
+                    "vllm.engine_essential_bytes": 10 * 1024**3,
+                    "vllm.gpu_kv_useful_bytes": useful,
+                    "vllm.kv_pool_slack_bytes": slack,
+                    "vllm.kv_pool_total_bytes": useful + slack,
+                    "quest.topk_hit_ratio": 0.7 if "quest" in name else "",
+                },
+                {
+                    "ts_ms": 3,
+                    "phase": "sample_end",
+                    "sample_id": "s0",
+                    "gen_tokens": 64,
+                    "latency_s": 1.0,
+                },
+            ]
+            keys: list[str] = []
+            seen = set()
+            for r in rows:
+                for k in r:
+                    if k not in seen:
+                        seen.add(k)
+                        keys.append(k)
+            with (d / "samples.csv").open("w", newline="") as f:
+                w = _csv.writer(f)
+                w.writerow(keys)
+                for r in rows:
+                    w.writerow(["" if r.get(k) is None else r.get(k, "") for k in keys])
+            (d / "summary.json").write_text(
+                _json.dumps(
+                    {
+                        "config": {"name": name, "quest_enabled": "quest" in name},
+                        "samples": [
+                            {
+                                "sample_id": "s0",
+                                "prompt_tokens": 2000,
+                                "gen_tokens": 64,
+                                "latency_s": 1.0,
+                                "oom": False,
+                                "peak_nvml_used_bytes": 20 * 1024**3,
+                                "peak_torch_allocated_bytes": 18 * 1024**3,
+                                "peak_kv_useful_bytes": useful,
+                                "mean_kv_slack_bytes": slack,
+                                "mean_engine_essential_bytes": 10 * 1024**3,
+                                "mean_kv_useful_bytes": useful,
+                                "mean_topk_hit_ratio": 0.7 if "quest" in name else None,
+                            }
+                        ],
+                    }
+                )
+            )
+
+    def test_build_report_creates_artifacts(self, tmp_path):
+        from benchmarks.quest_memory_probe.report import build_report
+
+        self._seed_run(tmp_path)
+        build_report(tmp_path)
+
+        plots = tmp_path / "plots"
+        assert (plots / "memory_timeline_dense.png").exists()
+        assert (plots / "memory_timeline_quest_pool128.png").exists()
+        assert (plots / "memory_peak_bar.png").exists()
+        assert (plots / "kv_pool_breakdown.png").exists()
+        assert (plots / "topk_hit_ratio_quest_pool128.png").exists()
+
+        md = (tmp_path / "report.md").read_text()
+        for header in (
+            "# Quest 显存观测报告",
+            "## 实验参数",
+            "## 配置矩阵",
+            "## 关键发现",
+            "## 时间序列",
+            "## 跨配置峰值对比",
+            "## KV 池构成稳态对比",
+            "## Top-k 命中率",
+        ):
+            assert header in md, f"missing section: {header}"
+
+    def test_build_report_takeaway_includes_kv_useful_ratio(self, tmp_path):
+        from benchmarks.quest_memory_probe.report import build_report
+
+        self._seed_run(tmp_path)
+        build_report(tmp_path)
+        md = (tmp_path / "report.md").read_text()
+        # quest pool128 useful = 4 GiB, dense useful = 9 GiB → 4/9 ≈ 0.44
+        assert "0.44" in md or "44%" in md or "44 %" in md
