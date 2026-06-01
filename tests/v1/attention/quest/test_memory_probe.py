@@ -632,3 +632,89 @@ class TestRunnerOomDetection:
         from benchmarks.quest_memory_probe.runner import _is_oom_error
 
         assert not _is_oom_error(ValueError("nope"))
+
+
+class TestCli:
+    def test_parse_compare_pool_size(self):
+        from benchmarks.quest_memory_probe.__main__ import build_parser
+
+        p = build_parser()
+        args = p.parse_args(
+            [
+                "compare-pool-size",
+                "--samples",
+                "longbench:narrativeqa:lengths=short:n=2",
+                "--top-k",
+                "16",
+                "--pool-sizes",
+                "512,128,16",
+                "--out-dir",
+                "/tmp/x",
+            ]
+        )
+        assert args.subcommand == "compare-pool-size"
+        assert args.top_k == 16
+        assert args.pool_sizes == [512, 128, 16]
+        assert args.out_dir == "/tmp/x"
+
+    def test_parse_dense_vs_quest(self):
+        from benchmarks.quest_memory_probe.__main__ import build_parser
+
+        p = build_parser()
+        args = p.parse_args(
+            [
+                "compare-dense-vs-quest",
+                "--samples",
+                "longbench:narrativeqa:lengths=short:n=2",
+                "--top-k",
+                "16",
+                "--quest-pool",
+                "128",
+                "--out-dir",
+                "/tmp/x",
+            ]
+        )
+        assert args.subcommand == "compare-dense-vs-quest"
+        assert args.quest_pool == 128
+
+    def test_parse_oom_sweep(self):
+        from benchmarks.quest_memory_probe.__main__ import build_parser
+
+        p = build_parser()
+        args = p.parse_args(
+            [
+                "oom-sweep",
+                "--samples",
+                "longbench:narrativeqa:lengths=short,medium,long:n=4",
+                "--top-k",
+                "16",
+                "--quest-pool",
+                "128",
+                "--out-dir",
+                "/tmp/x",
+            ]
+        )
+        assert args.subcommand == "oom-sweep"
+
+    def test_args_to_configs_pool_size(self):
+        from benchmarks.quest_memory_probe.__main__ import (
+            args_to_configs,
+            build_parser,
+        )
+
+        args = build_parser().parse_args(
+            [
+                "compare-pool-size",
+                "--samples",
+                "longbench:narrativeqa:lengths=short:n=1",
+                "--top-k",
+                "16",
+                "--pool-sizes",
+                "128,16",
+                "--out-dir",
+                "/tmp/x",
+            ]
+        )
+        cfgs = args_to_configs(args)
+        assert len(cfgs) == 2
+        assert all(c.quest_enabled for c in cfgs)
