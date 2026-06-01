@@ -320,3 +320,69 @@ class TestProbeSnapshot:
         assert snap["quest.gpu_resident_blocks"] is None
         assert snap["quest.topk_hit_ratio"] is None
         assert snap["vllm.gpu_kv_useful_bytes"] is None
+
+
+class TestSampler:
+    def test_sampler_collects_at_least_3_samples(self):
+        import queue
+        import time
+
+        from benchmarks.quest_memory_probe.sampler import Sampler
+
+        counter = {"n": 0}
+
+        def snap():
+            counter["n"] += 1
+            return {"foo": counter["n"]}
+
+        q: queue.Queue = queue.Queue()
+        s = Sampler(snapshot_fn=snap, interval_s=0.05, queue_=q)
+        s.start()
+        time.sleep(0.25)
+        s.stop()
+        s.join(timeout=1.0)
+
+        items = []
+        while not q.empty():
+            items.append(q.get_nowait())
+        # at 50ms interval over 250ms, expect >= 3 samples; allow noise up to 12
+        assert 3 <= len(items) <= 12
+        assert all(it["phase"] == "sampling" for it in items)
+        ts = [it["ts_ms"] for it in items]
+        assert ts == sorted(ts)
+
+    def test_sampler_records_probe_errors(self):
+        import queue
+        import time
+
+        from benchmarks.quest_memory_probe.sampler import Sampler
+
+        def boom():
+            raise RuntimeError("simulated probe failure")
+
+        q: queue.Queue = queue.Queue()
+        s = Sampler(snapshot_fn=boom, interval_s=0.05, queue_=q)
+        s.start()
+        time.sleep(0.15)
+        s.stop()
+        s.join(timeout=1.0)
+
+        items = []
+        while not q.empty():
+            items.append(q.get_nowait())
+        assert items
+        assert all(it["phase"] == "probe_error" for it in items)
+        assert all("simulated probe failure" in it["error"] for it in items)
+
+    def test_sampler_stop_is_idempotent(self):
+        import queue
+
+        from benchmarks.quest_memory_probe.sampler import Sampler
+
+        q: queue.Queue = queue.Queue()
+        s = Sampler(snapshot_fn=lambda: {}, interval_s=0.05, queue_=q)
+        s.start()
+        s.stop()
+        s.stop()  # second stop must not raise
+        s.join(timeout=1.0)
+        assert not s.is_alive()
