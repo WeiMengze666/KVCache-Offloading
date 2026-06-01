@@ -144,3 +144,60 @@ def test_no_eviction_no_spill_call():
         v = torch.full((4, 1, 8), float(b + 100), dtype=torch.float16, device="cuda")
         tm.on_block_filled(0, b, k, v)
     assert tm.stats().evict_d2h == 0
+
+
+def test_async_ensure_resident_matches_sync_on_arena():
+    """Mode 1 async H2D into the arena, waited via the returned event, must land
+    the SAME bytes as the synchronous reload. Both paths trim the SAME engine KV
+    into a cap-block arena, spill the overflow, then reload a spilled block; the
+    reloaded arena slot must be bit-identical under sync and async."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from vllm.v1.attention.backends.quest.async_transfer import QuestStreamPool
+    from vllm.v1.attention.backends.quest.cache.block_summary import BlockSummaryStore
+    from vllm.v1.attention.backends.quest.cache.cpu_backing_store import CpuKvBackingStore
+    from vllm.v1.attention.backends.quest.cache.residency import BlockResidency
+    from vllm.v1.attention.backends.quest.cache.tier_manager import TierManager
+
+    cap, bs, h, d, P, nb = 4, 256, 2, 64, 10, 16
+    engine = torch.randn(nb, 2, bs, h, d, dtype=torch.float16, device="cuda")
+    block_table_row = list(range(P))
+
+    def build(async_enabled):
+        summary = BlockSummaryStore(num_layers=1, max_blocks=nb, block_size=bs,
+                                    num_kv_heads=h, head_size=d,
+                                    dtype=torch.float16, device="cuda")
+        cpu = CpuKvBackingStore(num_layers=1, blocks_per_layer=nb, block_size=bs,
+                                num_kv_heads=h, head_size=d, dtype=torch.float16)
+        res = BlockResidency(num_layers=1, max_blocks=nb)
+        pool = QuestStreamPool() if async_enabled else None
+        return TierManager(
+            layer_idx=0, gpu_budget=cap,
+            gpu_k=torch.empty(cap, bs, h, d, dtype=torch.float16, device="cuda"),
+            gpu_v=torch.empty(cap, bs, h, d, dtype=torch.float16, device="cuda"),
+            summary_store=summary, residency=res, cpu_store=cpu,
+            stream_pool=pool, engine_kv_cache=engine,
+            gpu_pool_aliases_kv_cache=False,
+        )
+
+    def reload_block_3(async_enabled):
+        tm = build(async_enabled)
+        tm.trim_to_working_set(seq_id=0, num_full_blocks=P, kv_cache=engine,
+                               block_table_row=block_table_row)
+        # block 3 was spilled (trim keeps last cap-1=3 -> {7,8,9}).
+        ev = tm.ensure_resident(seq_id=0,
+                                logical_block_ids=torch.tensor([3], device="cuda"))
+        if ev is not None:
+            torch.cuda.current_stream().wait_event(ev)
+        torch.cuda.synchronize()
+        slot = tm.logical_to_slot(0, 3)
+        return tm.gpu_k[slot].clone(), tm.gpu_v[slot].clone(), tm.stats()
+
+    k_sync, v_sync, st_sync = reload_block_3(async_enabled=False)
+    k_async, v_async, st_async = reload_block_3(async_enabled=True)
+    # The reloaded KV must equal the original engine block under both paths.
+    assert torch.equal(k_sync, engine[3, 0])
+    assert torch.equal(k_async, engine[3, 0])
+    assert torch.equal(v_sync, engine[3, 1])
+    assert torch.equal(v_async, engine[3, 1])
+    assert st_sync.load_h2d == 1 and st_async.load_h2d == 1
