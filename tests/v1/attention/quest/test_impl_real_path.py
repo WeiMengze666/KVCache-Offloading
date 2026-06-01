@@ -673,3 +673,72 @@ def test_decode_live_block_lands_in_arena(cuda):
     live_slot = tm.logical_to_slot(0, full_blocks)  # the partial block
     phys = int(md.block_table[0, full_blocks].item())
     assert torch.equal(tm.gpu_k[live_slot], kv_cache[phys, 0])
+
+
+def test_arena_decode_reload_is_lossless_vs_no_spill(cuda):
+    """Offload-correctness via a cap A/B. Same top_k (<= cap), same query/KV.
+    A small arena (cap_small) forces spill+reload; a large arena (cap_big) never
+    spills. The decode outputs must MATCH because reloaded KV is bit-identical to
+    what was spilled. (We canNOT use 'select-all == dense' here: with cap < blocks
+    you cannot gather more than `cap` blocks in one flash_attn call, and the R1
+    '== dense' invariant inherently needs all selected blocks resident. The cap
+    A/B isolates the offload round-trip instead.)
+
+    NOTE: this is a post-revert CORRECTNESS assertion, not a red-first test —
+    Stage-0's gather is cap-agnostic (always reads the engine kv_cache), so it
+    reads the same intact source for both caps and would pass trivially. The
+    red-first guard that the read source actually moved to the arena is
+    test_arena_decode_reads_arena_not_engine below (it clobbers the engine)."""
+    import torch
+    from vllm.v1.attention.backends.quest.impl_helpers import (
+        notify_filled_blocks_after_decode, run_sparse_decode,
+    )
+    # 6 full blocks + partial; top_k=3 (<= both caps). cap_small=4 forces spill
+    # of blocks {0,1,2} at trim (keeps last 3 + live); cap_big=8 holds all.
+    def run(cap):
+        impl, layer, q, kv_cache, md, output, full_blocks, sl = \
+            _build_arena_path_state(cap=cap, num_full_blocks=6, with_partial=True,
+                                    seed=0)
+        md.quest_top_k = 3
+        notify_filled_blocks_after_decode(layer, kv_cache, md)
+        run_sparse_decode(impl, layer, q, kv_cache, md, output)
+        return output.clone(), layer.tier_manager.stats()
+    out_small, st_small = run(4)
+    out_big, st_big = run(8)
+    assert torch.allclose(out_small, out_big, atol=2e-3, rtol=2e-3), \
+        "reload must be lossless: small-arena output != large-arena output"
+    assert st_small.evict_d2h > 0 and st_small.load_h2d >= 0  # small arena spilled
+    assert st_big.evict_d2h == 0  # big arena never spilled
+
+
+def test_arena_decode_reads_arena_not_engine(cuda):
+    """Red-first guard for the Task-5 revert: the decode gather must read the
+    Quest ARENA (tm.gpu_k/gpu_v via logical_to_slot), NOT the engine kv_cache.
+
+    We populate the arena via notify, then CLOBBER the engine kv_cache with
+    garbage (the arena + CPU copies, taken before the clobber, stay correct).
+    A correct arena read reproduces the dense reference computed before the
+    clobber; the Stage-0 engine read would instead see garbage. cap=8 with
+    top_k>=full_blocks keeps every block resident (no overflow), so ==dense is
+    valid here."""
+    import torch
+    from flash_attn import flash_attn_with_kvcache
+    from vllm.v1.attention.backends.quest.impl_helpers import (
+        notify_filled_blocks_after_decode, run_sparse_decode,
+    )
+    impl, layer, q, kv_cache, md, output, full_blocks, sl = \
+        _build_arena_path_state(cap=8, num_full_blocks=6, with_partial=True,
+                                partial_len=128, seed=0)
+    md.quest_top_k = full_blocks  # select all -> ==dense valid, all resident
+    n_gather = full_blocks + 1  # 6 full + 1 partial
+    bt = md.block_table[0, :n_gather].to(torch.int32).unsqueeze(0)
+    cs = torch.tensor([sl], dtype=torch.int32, device="cuda")
+    dense = flash_attn_with_kvcache(
+        q[0:1].unsqueeze(1), kv_cache[:, 0], kv_cache[:, 1],
+        block_table=bt, cache_seqlens=cs, causal=True).squeeze(1)
+    notify_filled_blocks_after_decode(layer, kv_cache, md)
+    # Clobber the ENGINE cache: only an arena read survives this.
+    kv_cache.fill_(99.0)
+    run_sparse_decode(impl, layer, q, kv_cache, md, output)
+    assert torch.allclose(output, dense.reshape_as(output), atol=2e-3, rtol=2e-3), \
+        "decode must gather from the arena, not the clobbered engine cache"

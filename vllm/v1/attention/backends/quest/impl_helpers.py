@@ -254,37 +254,27 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
             )
             if h2d_event is not None:
                 torch.cuda.current_stream().wait_event(h2d_event)
-        # Translate selected logical block ids to PHYSICAL kv_cache rows.
-        #
-        # init_runtime_state binds tm.gpu_k/gpu_v as ZERO-COPY views of the
-        # engine-allocated kv_cache (gpu_k = kv_cache[:,0]; gpu_budget ==
-        # kv_cache.shape[0], the FULL cache — confirmed at runtime). So the
-        # authoritative physical row for ANY logical block is the vLLM paged
-        # slot md.block_table[req_idx, logical_id] — that is where the engine's
-        # reshape_and_cache_flash actually wrote (and keeps) the KV.
-        #
-        # We deliberately do NOT use tm.logical_to_slot here: the Quest LRU
-        # hands out pool slots from its own free list (0,1,2,...), which alias
-        # *different* physical rows than the ones vLLM allocated to this
-        # sequence. Those aliased rows get clobbered between prefill and decode
-        # (the two allocators collide over one shared tensor), so reading the
-        # pool slot returns garbage for the selected full blocks. Gathering
-        # from block_table reads the correct, engine-maintained rows. Selection,
-        # ensure_resident and the residency stats still run over top_ids above
-        # (unchanged); only the physical READ source is corrected here.
+        # Stage 2A: gather selected full blocks from the ARENA (tm.gpu_k/gpu_v)
+        # via the Quest LRU slot map. ensure_resident (above) has reloaded any
+        # CPU-resident selected block into the arena, so every top_id maps to a
+        # live arena row here. (Stage 0 read md.block_table / the engine cache
+        # because the "arena" then aliased the full engine tensor and its own
+        # slots were bogus; Tasks 1-4 made the arena a real, curated, bounded
+        # buffer, so we read it directly — the offload round-trip is real.)
         slot_list = [
-            int(md.block_table[req_idx, int(b)].item())
+            tm.logical_to_slot(seq_id=req_idx, logical_block_id=int(b))
             for b in top_ids.tolist()
         ]
         # Number of FULL blocks actually gathered (top_k may be < full_blocks).
         num_full_gathered = len(slot_list)
-        # ALWAYS append the trailing partial block (the live decode token). It
-        # is NOT in tier_manager; its KV physically lives at the vLLM-allocated
-        # paged slot block_table[req_idx, full_blocks], written by the engine's
-        # do_kv_cache_update before this forward. Never scored, never evicted.
+        # ALWAYS append the trailing partial block (the live decode token).
+        # notify_filled_blocks_after_decode copied it into a pinned arena slot
+        # keyed (req_idx, full_blocks) via write_live_block, so it is read from
+        # the arena too. Never scored, never selected, never evicted.
         if has_partial:
-            partial_slot = int(md.block_table[req_idx, full_blocks].item())
-            slot_list.append(partial_slot)
+            slot_list.append(
+                tm.logical_to_slot(seq_id=req_idx, logical_block_id=full_blocks)
+            )
         slots = torch.tensor(
             slot_list,
             dtype=torch.int32,
@@ -303,9 +293,10 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
             dtype=torch.int32,
             device=query.device,
         )
-        # kv_cache layout (num_blocks, 2, block_size, h_kv, head_size)
-        k_view = kv_cache[:, 0]
-        v_view = kv_cache[:, 1]
+        # Stage 2A: the gathered `slots` are ARENA slot indices, so the kernel
+        # reads the arena (tm.gpu_k/gpu_v), NOT the engine kv_cache.
+        k_view = tm.gpu_k
+        v_view = tm.gpu_v
         with _nvtx_range(f"quest.sparse_attn.L{tm.layer_idx}", nvtx_gate):
             out_req = flash_attn_with_kvcache(
                 query[req_idx : req_idx + 1].unsqueeze(1),
