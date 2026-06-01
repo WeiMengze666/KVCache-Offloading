@@ -295,3 +295,39 @@ def test_overlap_capture_noop_when_disabled():
     tm = _build(gpu_budget=8, enable_overlap_capture=False)
     tm.record_selected(step=0, seq_id=0, block_ids=[1, 2, 3])
     assert tm.drain_selected() == []
+
+
+def test_spill_hook_is_called_on_eviction():
+    """When the arena is full, on_block_filled evicts LRU and the spill goes
+    through the pluggable spill_hook (so Stage 2B can swap write-through in)."""
+    import torch, pytest
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from vllm.v1.attention.backends.quest.cache.tier_manager import TierManager
+    from vllm.v1.attention.backends.quest.cache.block_summary import BlockSummaryStore
+    from vllm.v1.attention.backends.quest.cache.cpu_backing_store import CpuKvBackingStore
+    from vllm.v1.attention.backends.quest.cache.residency import BlockResidency
+
+    cap, bs, h, d = 2, 256, 2, 64
+    summary = BlockSummaryStore(num_layers=1, max_blocks=16, block_size=bs,
+                                num_kv_heads=h, head_size=d,
+                                dtype=torch.float16, device="cuda")
+    cpu = CpuKvBackingStore(num_layers=1, blocks_per_layer=16, block_size=bs,
+                            num_kv_heads=h, head_size=d, dtype=torch.float16)
+    res = BlockResidency(num_layers=1, max_blocks=16)
+    tm = TierManager(layer_idx=0, gpu_budget=cap,
+                     gpu_k=torch.empty(cap, bs, h, d, dtype=torch.float16, device="cuda"),
+                     gpu_v=torch.empty(cap, bs, h, d, dtype=torch.float16, device="cuda"),
+                     summary_store=summary, residency=res, cpu_store=cpu,
+                     gpu_pool_aliases_kv_cache=False)
+    spilled = []
+    orig = tm._spill_to_cpu
+    def hook(seq_id, logical_block_id, *, slot):
+        spilled.append((seq_id, logical_block_id))
+        return orig(seq_id, logical_block_id, slot=slot)
+    tm.spill_hook = hook
+    blk = lambda: torch.randn(bs, h, d, dtype=torch.float16, device="cuda")
+    for b in range(cap + 1):  # cap fill, then one more => one eviction
+        tm.on_block_filled(seq_id=0, logical_block_id=b, k_block=blk(), v_block=blk())
+    assert spilled == [(0, 0)], f"LRU block (0,0) must spill via hook, got {spilled}"
+    assert tm.stats().evict_d2h == 1

@@ -140,6 +140,12 @@ class TierManager:
         self._stats = QuestStats()
         # Debug-only per-(step, seq) selected block-id log (overlap capture).
         self._selected_log: list[dict] = []
+        # Pluggable D2H spill seam. Default = the synchronous _spill_to_cpu
+        # defined below. Stage 2B write-through overrides this to mirror blocks
+        # to host on a d2h_stream at fill time instead of at eviction time.
+        # All eviction call sites (on_block_filled, _ensure_one_sync,
+        # _ensure_one_async) route their spill through this attribute.
+        self.spill_hook = self._spill_to_cpu
 
     def stats(self) -> QuestStats:
         return self._stats
@@ -205,7 +211,7 @@ class TierManager:
         slot, evicted = self._slot_map.add(key)
         if evicted is not None:
             # Spill the evicted block's data BEFORE we overwrite the slot.
-            self._spill_to_cpu(*evicted, slot=slot)
+            self.spill_hook(*evicted, slot=slot)
 
         if not self.gpu_pool_aliases_kv_cache:
             self.gpu_k[slot].copy_(k_block, non_blocking=False)
@@ -288,7 +294,7 @@ class TierManager:
             )
         slot, evicted = self._slot_map.add(key)
         if evicted is not None:
-            self._spill_to_cpu(*evicted, slot=slot)
+            self.spill_hook(*evicted, slot=slot)
         self.residency.begin_load(self.layer_idx, bid)
         self.cpu_store.load_block(
             self.layer_idx, cpu_slot,
@@ -312,7 +318,7 @@ class TierManager:
             )
         slot, evicted = self._slot_map.add(key)
         if evicted is not None:
-            self._spill_to_cpu(*evicted, slot=slot)
+            self.spill_hook(*evicted, slot=slot)
         # Residency state machine update fires synchronously, BEFORE the
         # async H2D actually completes. This is intentional: the state
         # tracks INTENT, not completion. The contract is:
