@@ -271,18 +271,20 @@ class QuestSparseOffloadBackend(AttentionBackend):
             layer_name = getattr(layer, "layer_name", None)
             if kv_caches is not None and layer_name in kv_caches:
                 full = kv_caches[layer_name]
-                # FA layout: (num_blocks, 2, block_size, num_kv_heads, head_size)
-                # Zero-copy slice views into the vLLM-allocated tensor.
-                gpu_k = full[:, 0]
-                gpu_v = full[:, 1]
-                gpu_budget = full.shape[0]
-                # gpu_k/gpu_v alias the engine's kv_cache (not a private Quest
-                # buffer). The KV for every logical block already lives at the
-                # engine paged slot md.block_table[req, logical_id]; the sparse
-                # decode read path gathers from there and on_block_filled must
-                # NOT copy KV into its aliased LRU slot. Flag it so TierManager
-                # skips the harmful/redundant copy + CPU tier movement.
-                pool_aliases_kv_cache = True
+                # Stage 2A: do NOT alias the full engine cache. Allocate a private
+                # bounded arena of gpu_cache_blocks_per_seq blocks; the engine
+                # tensor is kept ONLY as the SOURCE for the prefill->decode trim
+                # (TierManager.trim_to_working_set, added in a later task).
+                # FA layout: full.shape = (num_blocks, 2, block_size, num_kv_heads, head_size)
+                cap = quest_config.gpu_cache_blocks_per_seq
+                gpu_k = torch.empty(
+                    cap, full.shape[2], full.shape[3], full.shape[4],
+                    dtype=full.dtype, device=full.device,
+                )
+                gpu_v = torch.empty_like(gpu_k)
+                gpu_budget = cap
+                pool_aliases_kv_cache = False
+                engine_kv_for_layer = full
             else:
                 if kv_caches is not None:
                     logger.warning(
@@ -308,6 +310,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 # Private buffer: on_block_filled copies KV in and the decode
                 # read path reads via logical_to_slot (unit-test path).
                 pool_aliases_kv_cache = False
+                engine_kv_for_layer = None
             layer.tier_manager = TierManager(
                 layer_idx=slot,
                 gpu_budget=gpu_budget,
@@ -320,6 +323,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 enable_event_timing=quest_config.enable_debug_counters,
                 enable_overlap_capture=quest_config.enable_debug_counters,
                 gpu_pool_aliases_kv_cache=pool_aliases_kv_cache,
+                engine_kv_cache=engine_kv_for_layer,
             )
             layer._quest_selection_callable_ref = selection_callable
 

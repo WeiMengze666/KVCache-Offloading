@@ -97,6 +97,7 @@ class TierManager:
         enable_event_timing: bool = False,
         enable_overlap_capture: bool = False,
         gpu_pool_aliases_kv_cache: bool = False,
+        engine_kv_cache: torch.Tensor | None = None,
     ) -> None:
         self.layer_idx = layer_idx
         self.gpu_budget = gpu_budget
@@ -106,6 +107,10 @@ class TierManager:
         self.residency = residency
         self.cpu_store = cpu_store
         self.stream_pool = stream_pool
+        # Stage 2A: reference to the full engine-allocated kv_cache for this
+        # layer (None for unit-test/private-buffer paths). Kept ONLY as the
+        # SOURCE for the prefill->decode trim (trim_to_working_set, later task).
+        self.engine_kv_cache = engine_kv_cache
         # When True, gpu_k/gpu_v are a ZERO-COPY view of the engine-allocated
         # kv_cache (gpu_budget == kv_cache.shape[0]) rather than a private
         # Quest buffer. In this mode the KV for every logical block already

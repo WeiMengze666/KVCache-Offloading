@@ -142,9 +142,16 @@ def test_bind_runtime_attaches_tier_manager_using_kv_cache_view(cuda):
     )
     assert layers_dict["layer.1"].tier_manager is not None
     assert layers_dict["layer.2"].tier_manager is not None
+    # Stage 2A: each Quest layer gets a PRIVATE bounded arena, not a view of
+    # the full engine cache. gpu_k must NOT alias the engine tensor, and the
+    # arena size is gpu_cache_blocks_per_seq.
     assert (
         layers_dict["layer.1"].tier_manager.gpu_k.data_ptr()
-        == fake_kv["layer.1"][:, 0].data_ptr()
+        != fake_kv["layer.1"][:, 0].data_ptr()
+    )
+    assert (
+        layers_dict["layer.1"].tier_manager.gpu_budget
+        == quest_cfg.gpu_cache_blocks_per_seq
     )
     # full_kv layer 0: no tier_manager attached.
     assert getattr(layers_dict["layer.0"], "tier_manager", None) is None
@@ -451,3 +458,38 @@ def test_bind_runtime_stashes_selection_callable_triton():
     assert getattr(layer, "_quest_selection_callable_ref", None) is (
         quest_selection_triton
     )
+
+
+def test_real_engine_layer_gets_bounded_arena():
+    """init_runtime_state must give each Quest layer a private arena of
+    gpu_cache_blocks_per_seq blocks, NOT a view of the full engine cache."""
+    import torch
+    import pytest
+    from types import SimpleNamespace
+    from vllm.config.quest import QuestConfig
+    from vllm.v1.attention.backends.quest.backend import QuestSparseOffloadBackend
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    cap = 8
+    block_size, h_kv, hd = 256, 2, 64
+    full_blocks = 64  # engine cache is much bigger than the arena
+    qcfg = QuestConfig(enabled=True, top_k=8, gpu_cache_blocks_per_seq=cap,
+                       full_kv_layers=[0, 1], block_size=block_size)
+    layer = SimpleNamespace(
+        layer_idx=2, layer_name="model.layers.2.self_attn.attn",
+        num_kv_heads=h_kv, head_size=hd, kv_cache_torch_dtype=torch.float16,
+    )
+    engine_kv = torch.zeros(full_blocks, 2, block_size, h_kv, hd,
+                            dtype=torch.float16, device="cuda")
+    QuestSparseOffloadBackend.init_runtime_state(
+        layers=[layer], block_size=block_size, num_kv_heads=h_kv, head_size=hd,
+        max_blocks_total=full_blocks, dtype=torch.float16, quest_config=qcfg,
+        kv_caches={"model.layers.2.self_attn.attn": engine_kv},
+    )
+    tm = layer.tier_manager
+    assert tm.gpu_budget == cap, f"arena must be cap={cap}, got {tm.gpu_budget}"
+    assert tm.gpu_k.shape[0] == cap
+    assert tm.gpu_k.data_ptr() != engine_kv[:, 0].data_ptr()  # not aliased
+    assert tm.gpu_pool_aliases_kv_cache is False
+    assert tm.engine_kv_cache is engine_kv  # kept as trim source
