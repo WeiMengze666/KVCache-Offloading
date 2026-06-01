@@ -67,3 +67,82 @@ class RunConfig:
         if "full_kv_layers" in d and isinstance(d["full_kv_layers"], list):
             d["full_kv_layers"] = tuple(d["full_kv_layers"])
         return cls(**d)
+
+
+def _make(name: str, **overrides: Any) -> RunConfig:
+    cfg = RunConfig(name=name, **overrides)
+    cfg.validate()
+    return cfg
+
+
+def expand_dense_vs_quest(
+    *,
+    workload_spec: str,
+    top_k: int,
+    quest_pool: int,
+) -> list[RunConfig]:
+    """Subcommand A: dense baseline vs Quest enabled (no offload pressure)."""
+    return [
+        _make(
+            name="dense",
+            workload_spec=workload_spec,
+            quest_enabled=False,
+        ),
+        _make(
+            name=f"quest_pool{quest_pool}_topk{top_k}",
+            workload_spec=workload_spec,
+            quest_enabled=True,
+            top_k=top_k,
+            gpu_cache_blocks_per_seq=quest_pool,
+        ),
+    ]
+
+
+def expand_pool_size(
+    *,
+    workload_spec: str,
+    top_k: int,
+    pool_sizes: list[int],
+) -> list[RunConfig]:
+    """Subcommand B: same Quest config, sweep gpu_cache_blocks_per_seq.
+
+    Each pool_size must be a multiple of top_k (Quest invariant: every decode
+    step's selected set must fit in the GPU pool). Validation runs in
+    RunConfig.validate(); we just construct + validate here.
+    """
+    out: list[RunConfig] = []
+    for p in pool_sizes:
+        out.append(
+            _make(
+                name=f"quest_pool{p}_topk{top_k}",
+                workload_spec=workload_spec,
+                quest_enabled=True,
+                top_k=top_k,
+                gpu_cache_blocks_per_seq=p,
+            )
+        )
+    return out
+
+
+def expand_oom_sweep(
+    *,
+    workload_spec: str,
+    top_k: int,
+    quest_pool: int,
+) -> list[RunConfig]:
+    """Subcommand C: dense vs one Quest config; runner orders samples by
+    prompt_tokens ascending and walks until OOM."""
+    return [
+        _make(
+            name="dense_oom",
+            workload_spec=workload_spec,
+            quest_enabled=False,
+        ),
+        _make(
+            name=f"quest_pool{quest_pool}_topk{top_k}_oom",
+            workload_spec=workload_spec,
+            quest_enabled=True,
+            top_k=top_k,
+            gpu_cache_blocks_per_seq=quest_pool,
+        ),
+    ]
