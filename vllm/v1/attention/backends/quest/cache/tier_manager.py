@@ -111,15 +111,17 @@ class TierManager:
         # layer (None for unit-test/private-buffer paths). Kept ONLY as the
         # SOURCE for the prefill->decode trim (trim_to_working_set, later task).
         self.engine_kv_cache = engine_kv_cache
-        # When True, gpu_k/gpu_v are a ZERO-COPY view of the engine-allocated
-        # kv_cache (gpu_budget == kv_cache.shape[0]) rather than a private
-        # Quest buffer. In this mode the KV for every logical block already
-        # lives at the engine's paged slot (md.block_table[req, logical_id]),
-        # so on_block_filled must NOT copy KV into its LRU slot (that slot
-        # aliases a DIFFERENT engine row and the copy corrupts it), and the
-        # decode read path gathers blocks via block_table, not logical_to_slot.
-        # Set by init_runtime_state when binding to a real engine; False for
-        # unit tests that construct a private gpu_k/gpu_v.
+        # Stage 2A removed the Stage-0 aliasing mode entirely: gpu_k/gpu_v are
+        # ALWAYS a private bounded arena now, never a zero-copy view of the
+        # engine kv_cache. The parameter is retained (defaulting False) only so
+        # existing call sites/tests keep constructing cleanly; True is no longer
+        # a supported mode. Assert it to catch any accidental re-introduction —
+        # if this fires, a caller is trying to resurrect the offload-bypass
+        # crutch.
+        assert not gpu_pool_aliases_kv_cache, (
+            "gpu_pool_aliases_kv_cache=True is unsupported after Stage 2A; "
+            "the Quest arena is always a private bounded buffer."
+        )
         self.gpu_pool_aliases_kv_cache = gpu_pool_aliases_kv_cache
         # Benchmark/debug-only: when True, ensure_resident / _spill_to_cpu
         # bracket their copies with cuda Events and accumulate GPU time into
@@ -235,19 +237,12 @@ class TierManager:
             # Spill the evicted block's data BEFORE we overwrite the slot.
             self.spill_hook(*evicted, slot=slot)
 
-        if not self.gpu_pool_aliases_kv_cache:
-            self.gpu_k[slot].copy_(k_block, non_blocking=False)
-            self.gpu_v[slot].copy_(v_block, non_blocking=False)
-        # When the pool is a zero-copy view of the engine kv_cache
-        # (gpu_pool_aliases_kv_cache=True), the KV already lives at the
-        # engine's paged slot and the sparse-decode read path gathers it via
-        # md.block_table. Copying here would instead write into this LRU
-        # slot's *aliased* engine row (a DIFFERENT physical block than the
-        # one the engine allocated to this sequence), corrupting whatever the
-        # engine keeps there. So the copy is both redundant and harmful in
-        # that mode and is skipped; only the summary (above) + LRU/residency
-        # bookkeeping are maintained. See run_sparse_decode for the read-side
-        # counterpart and the architecture note.
+        # Copy the filled block into its private arena slot. (Stage 2A: the
+        # arena is always a real private buffer now — the Stage-0 aliasing mode,
+        # where this copy was skipped because gpu_k aliased the engine cache, is
+        # gone; see the assert in __init__.)
+        self.gpu_k[slot].copy_(k_block, non_blocking=False)
+        self.gpu_v[slot].copy_(v_block, non_blocking=False)
         self.residency.mark_on_gpu(self.layer_idx, logical_block_id)
         self._stats.block_filled += 1
         return slot
@@ -343,18 +338,6 @@ class TierManager:
         """
         ids = logical_block_ids.cpu().tolist()
         keep = keep_resident_ids or []
-        if self.gpu_pool_aliases_kv_cache:
-            # Aliasing mode: gpu_k/gpu_v ARE the engine kv_cache; every block
-            # is always physically present at its engine paged slot and the
-            # decode path reads it via md.block_table. There is nothing to pull
-            # back from the CPU tier (it is never populated in this mode — see
-            # on_block_filled / _spill_to_cpu), so residency is trivially
-            # satisfied. Touch the LRU recency for selected blocks (so eviction
-            # order stays sensible if the pool ever fills) and return no event.
-            for bid in ids:
-                if (seq_id, bid) in self._slot_map:
-                    self._slot_map.get((seq_id, bid))
-            return None
 
         # Pass 1: protect the blocks this step needs that are already resident
         # (selected-and-resident + the live/keep blocks) by touching them to
@@ -477,18 +460,6 @@ class TierManager:
         the source tensor keeps PyTorch's caching allocator from recycling
         the underlying memory until d2h_stream finishes the copy.
         """
-        if self.gpu_pool_aliases_kv_cache:
-            # Aliasing mode: the "slot" is an engine kv_cache row, not a
-            # private Quest buffer. Spilling it to CPU would (a) snapshot data
-            # the engine still owns and (b) imply a later H2D back into that
-            # aliased row, corrupting the engine. The decode read path never
-            # consults the CPU tier in this mode (it reads via block_table),
-            # so the only thing eviction needs to do is drop the LRU entry,
-            # which the caller (_LRUSlotMap.add) has already done. Just mark
-            # the residency state; no data movement.
-            self.residency.begin_evict(self.layer_idx, logical_block_id)
-            self.residency.complete_evict(self.layer_idx, logical_block_id)
-            return
         cpu_slot = self.cpu_store.alloc(self.layer_idx)
         self.residency.begin_evict(self.layer_idx, logical_block_id)
         if self.stream_pool is None:

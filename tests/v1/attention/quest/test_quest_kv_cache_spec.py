@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""QuestKVCacheSpec sizes itself by the working set, not by max_model_len."""
+"""QuestKVCacheSpec reports a working-set budget for feasibility checks.
+
+Def-2: max_memory_usage_bytes is a feasibility/concurrency metric, NOT a
+physical-allocation directive (the reserved GPU pool stays global). These tests
+verify the arithmetic of that metric; they do not imply a smaller reserved peak.
+"""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -19,7 +24,7 @@ def _vllm_config(max_model_len: int = 32768):
     )
 
 
-def test_quest_spec_max_memory_uses_working_set_not_full_seq():
+def test_quest_spec_max_memory_reports_working_set_not_full_seq():
     from vllm.v1.kv_cache_interface import QuestKVCacheSpec
 
     spec = QuestKVCacheSpec(
@@ -68,7 +73,10 @@ def test_quest_spec_copy_with_new_block_size_preserves_budget():
 
 
 def test_quest_spec_savings_vs_full_attention():
-    """Sanity: 70% memory cut at gpu_budget=32 for a 32k context model."""
+    """Sanity: at gpu_budget=32 for a 32k-context model the Quest per-layer
+    feasibility METRIC is >=70% smaller than FullAttentionSpec's. This is a
+    feasibility/concurrency number (Def-2), NOT a reserved-pool cut — the
+    physical reserved GPU pool stays global either way."""
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         QuestKVCacheSpec,
@@ -92,7 +100,7 @@ def test_quest_spec_savings_vs_full_attention():
     full_bytes = full.max_memory_usage_bytes(cfg)
     quest_bytes = quest.max_memory_usage_bytes(cfg)
     assert quest_bytes < full_bytes
-    assert quest_bytes / full_bytes < 0.30  # at least 70% saved per layer
+    assert quest_bytes / full_bytes < 0.30  # >=70% smaller feasibility metric
 
 
 def test_quest_spec_validates_positive_budget():

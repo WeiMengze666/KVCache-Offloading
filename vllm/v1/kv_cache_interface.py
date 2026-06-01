@@ -600,10 +600,15 @@ class MambaSpec(KVCacheSpec):
 class QuestKVCacheSpec(AttentionSpec):
     """Per-layer KV cache spec for layers handled by the Quest backend.
 
-    Unlike FullAttentionSpec which sizes GPU memory by max_model_len, this
-    spec sizes GPU memory by `gpu_cache_blocks_per_seq` — the Quest GPU
-    working set. Evicted blocks live in pinned CPU memory managed
-    separately by the Quest backend (CpuKvBackingStore).
+    Def-2 framing (Stage 2A): vLLM reserves ONE global physical KV pool sized
+    to gpu_memory_utilization; `num_blocks` is a single global value and every
+    layer's KV tensor is `page_size * num_blocks`. This spec does NOT shrink
+    that reserved pool. Instead, the Quest backend bounds RESIDENCY: each Quest
+    layer keeps only `gpu_cache_blocks_per_seq` blocks per sequence resident in
+    a private GPU arena (see QuestSparseOffloadBackend.init_runtime_state),
+    spilling the rest to pinned host memory (CpuKvBackingStore). The win is
+    higher achievable concurrency / longer context at the same reserved GPU
+    bytes — more/longer sequences fit — NOT a smaller reserved peak.
     """
 
     gpu_cache_blocks_per_seq: int
@@ -620,9 +625,12 @@ class QuestKVCacheSpec(AttentionSpec):
         return KVCacheSpecKind.QUEST_ATTENTION
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        # vLLM allocates GPU pool for `num_concurrent_seqs * blocks_per_seq`.
-        # For Quest layers the per-seq budget is the working set, not the
-        # full sequence length.
+        # Feasibility/concurrency metric ONLY — NOT a physical allocation
+        # directive. The reserved GPU pool is global (sized to
+        # gpu_memory_utilization, num_blocks * page_size per layer); this value
+        # is consulted only by feasibility/concurrency checks. Quest's saving is
+        # bounded residency (gpu_cache_blocks_per_seq blocks/seq resident), not a
+        # smaller tensor. See the class docstring (Def-2).
         return self.gpu_cache_blocks_per_seq * self.page_size_bytes
 
 
