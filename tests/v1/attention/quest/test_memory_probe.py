@@ -206,3 +206,117 @@ class TestLongBenchLoader:
         samples = workload.load_samples("longbench:narrativeqa:lengths=short:n=1")
         assert len(samples) == 1
         assert samples[0].sample_id.startswith("synthetic/")
+
+
+class FakeStats:
+    block_filled = 1
+    evict_d2h = 2
+    load_h2d = 3
+    select_calls = 4
+    selected_total = 64
+    selected_on_gpu = 48
+    h2d_wait_ms = 1.5
+    evict_stall_ms = 0.5
+    h2d_wait_events = 1
+    evict_stall_events = 1
+
+
+class FakeTM:
+    def __init__(self, layer_idx, gpu_resident, cpu_resident):
+        self.layer_idx = layer_idx
+        self._gpu_resident = gpu_resident
+        self._cpu_resident = cpu_resident
+        self._stats = FakeStats()
+        _n = gpu_resident
+        self._slot_map = type("M", (), {"size": lambda self, _n=_n: _n})()
+        self._cpu_slots = {i: i for i in range(cpu_resident)}
+
+    def stats(self):
+        return self._stats
+
+
+class FakeRunner:
+    def __init__(self, tier_managers):
+        self._tier_managers = tier_managers
+        self.model_memory_usage = 6 * 1024**3
+
+    def quest_tier_managers_for_probe(self):
+        return self._tier_managers
+
+
+class FakeWorker:
+    def __init__(self, tier_managers):
+        self.model_runner = FakeRunner(tier_managers)
+        self.available_kv_cache_memory_bytes = 10 * 1024**3
+
+
+class TestProbeSnapshot:
+    def test_quest_aggregation_sums_layers(self, monkeypatch):
+        from benchmarks.quest_memory_probe import probes
+
+        monkeypatch.setattr(
+            probes,
+            "_torch_metrics",
+            lambda: {
+                "torch.allocated_bytes": 100,
+                "torch.reserved_bytes": 200,
+                "torch.peak_allocated_bytes": 150,
+                "torch.active_bytes": 90,
+            },
+        )
+        monkeypatch.setattr(
+            probes,
+            "_nvml_metrics",
+            lambda: {
+                "nvml.gpu_used_bytes": 300,
+                "nvml.gpu_total_bytes": 1000,
+            },
+        )
+        worker = FakeWorker([FakeTM(0, 5, 3), FakeTM(1, 7, 1)])
+        snap = probes.probe_snapshot(worker, bytes_per_block=4096)
+
+        assert snap["quest.gpu_resident_blocks"] == 12
+        assert snap["quest.cpu_resident_blocks"] == 4
+        assert snap["quest.gpu_resident_bytes"] == 12 * 4096
+        assert snap["quest.cpu_resident_bytes"] == 4 * 4096
+        assert snap["quest.selected_total"] == 128
+        assert snap["quest.selected_on_gpu"] == 96
+        assert snap["quest.topk_hit_ratio"] == pytest.approx(96 / 128)
+        assert snap["vllm.kv_pool_total_bytes"] == 10 * 1024**3
+        assert snap["vllm.gpu_kv_useful_bytes"] == 12 * 4096
+        assert snap["vllm.kv_pool_slack_bytes"] == 10 * 1024**3 - 12 * 4096
+
+    def test_dense_path_quest_fields_null(self, monkeypatch):
+        from benchmarks.quest_memory_probe import probes
+
+        monkeypatch.setattr(
+            probes,
+            "_torch_metrics",
+            lambda: {
+                "torch.allocated_bytes": 100,
+                "torch.reserved_bytes": 200,
+                "torch.peak_allocated_bytes": 150,
+                "torch.active_bytes": 90,
+            },
+        )
+        monkeypatch.setattr(
+            probes,
+            "_nvml_metrics",
+            lambda: {
+                "nvml.gpu_used_bytes": 300,
+                "nvml.gpu_total_bytes": 1000,
+            },
+        )
+
+        class DenseRunner:
+            model_memory_usage = 6 * 1024**3
+
+        class DenseWorker:
+            model_runner = DenseRunner()
+            available_kv_cache_memory_bytes = 10 * 1024**3
+
+        snap = probes.probe_snapshot(DenseWorker(), bytes_per_block=None)
+
+        assert snap["quest.gpu_resident_blocks"] is None
+        assert snap["quest.topk_hit_ratio"] is None
+        assert snap["vllm.gpu_kv_useful_bytes"] is None
