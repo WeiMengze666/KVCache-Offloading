@@ -2320,17 +2320,12 @@ class EngineArgs:
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
         )
-        config.quest_config = _quest_config_from_args(self)
-        config.arkvale_config = _arkvale_config_from_args(self)
+        config.quest_config, config.arkvale_config = (
+            self._resolve_sparse_offload_configs()
+        )
 
         quest_on = config.quest_config is not None and config.quest_config.enabled
         arkvale_on = config.arkvale_config is not None and config.arkvale_config.enabled
-        if quest_on and arkvale_on:
-            raise ValueError(
-                "enable_quest_sparse_offload and "
-                "enable_arkvale_sparse_offload are mutually exclusive; "
-                "pick exactly one."
-            )
         if quest_on or arkvale_on:
             if config.attention_config.backend is None:
                 config.attention_config.backend = AttentionBackendEnum.CUSTOM
@@ -2342,6 +2337,28 @@ class EngineArgs:
                 )
 
         return config
+
+    def _resolve_sparse_offload_configs(
+        self,
+    ) -> "tuple[QuestConfig | None, ArkValeConfig | None]":
+        """Translate engine args into Quest / ArkVale configs, enforcing
+        mutual exclusion. Returns (quest_cfg, arkvale_cfg). Either may be
+        None; both being non-None-and-enabled raises ValueError.
+
+        Extracted for testability — production callers go through
+        create_engine_config.
+        """
+        quest_cfg = _quest_config_from_args(self)
+        arkvale_cfg = _arkvale_config_from_args(self)
+        quest_on = quest_cfg is not None and quest_cfg.enabled
+        arkvale_on = arkvale_cfg is not None and arkvale_cfg.enabled
+        if quest_on and arkvale_on:
+            raise ValueError(
+                "enable_quest_sparse_offload and "
+                "enable_arkvale_sparse_offload are mutually exclusive; "
+                "pick exactly one."
+            )
+        return quest_cfg, arkvale_cfg
 
     def _check_feature_supported(self):
         """Raise an error if the feature is not supported."""
