@@ -51,6 +51,18 @@ class QuestConfig:
     # the 2A write-back path byte-for-byte.
     enable_write_through: bool = False
 
+    # Stage 2C-v2: footprint reduction via kv-share eviction. When True, the
+    # non-full-KV Quest layers are routed OUT of the HMA KV-cache groups by
+    # pointing each at the first Quest layer ("scratch") via vLLM's kv-sharing
+    # channel (wired at construction time). The engine then reserves blocks only
+    # for the full-KV layers + the one scratch layer, so gpu_memory_utilization
+    # can be lowered → the reserved pool actually shrinks (real footprint drop).
+    # Quest owns the KV write for the shared layers (the engine's auto-write is
+    # skipped under kv-share). Requires prefix caching OFF (shared layers reuse
+    # one physical scratch tensor — prefix-cache reuse would be silent
+    # corruption). Opt-in; False keeps the 2A/2B path byte-for-byte.
+    footprint_kvshare: bool = False
+
     # Async (Phase C activates these).
     enable_async_prefetch: bool = False
     """Phase C gate. When True, ensure_resident issues non_blocking=True H2D
@@ -160,6 +172,11 @@ class QuestConfig:
             raise ValueError(
                 f"enable_write_through must be a bool, "
                 f"got {self.enable_write_through!r}"
+            )
+        if not isinstance(self.footprint_kvshare, bool):
+            raise ValueError(
+                f"footprint_kvshare must be a bool, "
+                f"got {self.footprint_kvshare!r}"
             )
 
     def to_dict(self) -> dict[str, Any]:

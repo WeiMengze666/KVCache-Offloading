@@ -118,3 +118,56 @@ def test_quest_disabled_returns_no_errors():
         quest_config=QuestConfig(enabled=False),
     )
     assert errors == []
+
+
+def test_footprint_kvshare_requires_prefix_caching_off():
+    """Stage 2C-v2 (Task A3): under footprint_kvshare the shared Quest layers
+    reuse ONE physical scratch tensor, so any prefix-cache reuse of those blocks
+    is silent corruption. validate_quest_configuration must reject it loudly.
+    This is a TEMPORARY constraint of the kv-share-eviction design, not a vLLM
+    invariant."""
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+
+    errors = QuestSparseOffloadBackend.validate_quest_configuration(
+        model_config=_model_config(),
+        cache_config=SimpleNamespace(
+            block_size=256, enable_prefix_caching=True
+        ),
+        quest_config=_quest_cfg(footprint_kvshare=True),
+    )
+    assert any("prefix" in e.lower() for e in errors), errors
+
+
+def test_footprint_kvshare_ok_with_prefix_caching_off():
+    """The same config is accepted once prefix caching is off."""
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+
+    errors = QuestSparseOffloadBackend.validate_quest_configuration(
+        model_config=_model_config(),
+        cache_config=SimpleNamespace(
+            block_size=256, enable_prefix_caching=False
+        ),
+        quest_config=_quest_cfg(footprint_kvshare=True),
+    )
+    assert errors == []
+
+
+def test_no_prefix_caching_check_when_footprint_kvshare_off():
+    """With footprint_kvshare off (the 2A/2B default), prefix-caching state is
+    not Quest's concern at this layer — no extra error is raised here."""
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+
+    errors = QuestSparseOffloadBackend.validate_quest_configuration(
+        model_config=_model_config(),
+        cache_config=SimpleNamespace(
+            block_size=256, enable_prefix_caching=True
+        ),
+        quest_config=_quest_cfg(footprint_kvshare=False),
+    )
+    assert not any("prefix" in e.lower() for e in errors), errors

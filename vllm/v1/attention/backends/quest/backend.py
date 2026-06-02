@@ -158,6 +158,24 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 "block_size % 256 == 0. Set --block-size 256 or larger."
             )
 
+        # Stage 2C-v2 (Task A3): under footprint_kvshare the non-full-KV Quest
+        # layers are aliased to ONE physical scratch tensor (kv-share). Prefix
+        # caching would let vLLM's block manager reuse those blocks behind the
+        # TierManager's back → silent corruption. This is a TEMPORARY constraint
+        # of the kv-share-eviction design, NOT a vLLM invariant; guard it loudly
+        # so a future change (or a user flag) fails instead of corrupting.
+        if getattr(quest_config, "footprint_kvshare", False) and getattr(
+            cache_config, "enable_prefix_caching", False
+        ):
+            errors.append(
+                "footprint_kvshare requires prefix caching to be OFF "
+                "(enable_prefix_caching=False). The shared Quest layers reuse "
+                "one physical scratch tensor, so prefix-cache reuse of those "
+                "blocks is silent corruption. This is a TEMPORARY constraint of "
+                "the kv-share-eviction design, not a vLLM invariant. Pass "
+                "--no-enable-prefix-caching."
+            )
+
         if quest_config.top_k > quest_config.gpu_cache_blocks_per_seq - 1:
             errors.append(
                 f"top_k ({quest_config.top_k}) must be <= "

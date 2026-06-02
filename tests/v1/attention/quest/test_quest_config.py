@@ -115,6 +115,31 @@ def test_quest_stats_has_evict_drop():
     assert s.evict_drop == 1
 
 
+def test_quest_config_footprint_kvshare_roundtrip():
+    """Stage 2C-v2: footprint_kvshare defaults False and survives to_dict /
+    from_dict so a JSON --quest-config can flip it on."""
+    from vllm.config.quest import QuestConfig
+
+    default = QuestConfig()
+    assert default.footprint_kvshare is False
+    assert default.to_dict()["footprint_kvshare"] is False
+
+    on = QuestConfig(enabled=True, footprint_kvshare=True)
+    d = on.to_dict()
+    assert d["footprint_kvshare"] is True
+    restored = QuestConfig.from_dict(d)
+    assert restored.footprint_kvshare is True
+    assert restored == on
+
+
+def test_quest_config_footprint_kvshare_validates_bool():
+    """validate() rejects a non-bool footprint_kvshare (config-time guard)."""
+    from vllm.config.quest import QuestConfig
+
+    with pytest.raises(ValueError, match="footprint_kvshare"):
+        QuestConfig(enabled=True, footprint_kvshare="yes").validate()
+
+
 def test_vllm_config_has_quest_config_field_default_none():
     from vllm.config import VllmConfig
     import dataclasses

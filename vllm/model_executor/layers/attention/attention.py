@@ -51,6 +51,58 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _quest_kvshare_target(
+    layer_idx: int,
+    full_kv_layers: list[int],
+    layer_name: str,
+    constructed_layer_names: list[str],
+) -> str | None:
+    """Stage 2C-v2: pick the kv-share scratch target for a Quest layer.
+
+    Pure decision used by the construction-time wiring (gated behind
+    QuestConfig.footprint_kvshare): given this layer's index, the full-KV layer
+    set, and the attention layer names already constructed (in execution
+    order), return the layer name this Quest layer should kv-share to — or None
+    if it must keep its own KV.
+
+    Rules:
+      - full-KV layers keep their own KV (return None);
+      - the FIRST Quest layer (lowest index not in full_kv_layers) is the
+        "scratch" layer — it keeps its own KV and becomes the shared physical
+        tensor (return None);
+      - every later Quest layer shares to that scratch layer.
+
+    `constructed_layer_names` is ordered by construction (== execution) order,
+    so the scratch layer always precedes the sharing layers — satisfying
+    validate_kv_sharing_target's "target must come before" rule.
+
+    Kept import-free of any quest module so the wiring site preserves the
+    zero-impact-when-disabled contract.
+    """
+    full = set(full_kv_layers)
+    if layer_idx in full:
+        return None
+    # Find the lowest constructed Quest layer = scratch.
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    scratch_name: str | None = None
+    scratch_idx: int | None = None
+    for name in constructed_layer_names:
+        try:
+            idx = extract_layer_index(name)
+        except Exception:
+            continue
+        if idx in full:
+            continue
+        if scratch_idx is None or idx < scratch_idx:
+            scratch_idx = idx
+            scratch_name = name
+    if scratch_idx is None or layer_idx <= scratch_idx:
+        # This layer IS the scratch (or precedes it) -> keep own KV.
+        return None
+    return scratch_name
+
+
 def validate_kv_sharing_target(
     current_layer_name, target_layer_name, static_forward_context
 ):
@@ -406,6 +458,40 @@ class Attention(nn.Module, AttentionLayerBase):
                 compilation_config.static_forward_context,
             )
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+
+        # Stage 2C-v2 (footprint_kvshare): route later Quest layers OUT of the
+        # HMA KV-cache groups by kv-sharing to the first Quest layer (scratch).
+        # Wired HERE at construction time on purpose: spec collection reads
+        # kv_sharing_target_layer_name at attn_utils.py get_kv_cache_spec()
+        # (skipping shared layers), and that read happens BEFORE forward — a
+        # later assignment (e.g. from get_kv_cache_spec) is too late, the layer
+        # would already have been given its own spec. With the target set here,
+        # the engine reserves ZERO blocks for these layers and Quest owns their
+        # KV write (Stage B). TEMPORARY-DESIGN: this borrows the kv-share alias
+        # as a scratch buffer and requires prefix caching OFF — guarded in
+        # QuestSparseOffloadBackend.validate_quest_configuration.
+        if self.kv_sharing_target_layer_name is None:
+            _quest_cfg = getattr(vllm_config, "quest_config", None)
+            if (
+                _quest_cfg is not None
+                and getattr(_quest_cfg, "enabled", False)
+                and getattr(_quest_cfg, "footprint_kvshare", False)
+            ):
+                _tgt = _quest_kvshare_target(
+                    self.layer_idx,
+                    _quest_cfg.full_kv_layers,
+                    prefix,
+                    list(compilation_config.static_forward_context.keys()),
+                )
+                if _tgt is not None:
+                    validate_kv_sharing_target(
+                        prefix,
+                        _tgt,
+                        compilation_config.static_forward_context,
+                    )
+                    self.kv_sharing_target_layer_name = _tgt
+                    if hasattr(self, "impl"):
+                        self.impl.kv_sharing_target_layer_name = _tgt
 
         # use a placeholder kv cache tensor during init, which will be replaced
         # by bind_kv_cache
