@@ -118,6 +118,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessor
 from vllm.version import __version__ as VLLM_VERSION
 
 if TYPE_CHECKING:
+    from vllm.config.arkvale import ArkValeConfig
     from vllm.config.quantization import QuantizationConfigArgs
     from vllm.config.quest import QuestConfig
     from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -662,6 +663,11 @@ class EngineArgs:
     quest_top_k: int | None = None
     quest_cpu_cache_blocks: int | None = None
     quest_config: str | None = None  # path to JSON file
+
+    enable_arkvale_sparse_offload: bool = False
+    arkvale_top_k: int | None = None
+    arkvale_cpu_cache_blocks: int | None = None
+    arkvale_config: str | None = None  # path to JSON file
 
     generation_config: str = ModelConfig.generation_config
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
@@ -1504,6 +1510,36 @@ class EngineArgs:
             help="(Quest) Path to a JSON file overriding any QuestConfig "
             "fields. CLI flags above take precedence over the file.",
         )
+        vllm_group.add_argument(
+            "--enable-arkvale-sparse-offload",
+            action="store_true",
+            default=EngineArgs.enable_arkvale_sparse_offload,
+            help="Enable the ArkVale (cuboid_mean) sparse + KV-offload "
+            "backend. Mutually exclusive with --enable-quest-sparse-offload. "
+            "Reuses the Quest backend stack; only the page-digest formula "
+            "differs.",
+        )
+        vllm_group.add_argument(
+            "--arkvale-top-k",
+            type=int,
+            default=EngineArgs.arkvale_top_k,
+            help="(ArkVale) Number of KV blocks selected per decode step. "
+            "Has no effect unless --enable-arkvale-sparse-offload is set.",
+        )
+        vllm_group.add_argument(
+            "--arkvale-cpu-cache-blocks",
+            type=int,
+            default=EngineArgs.arkvale_cpu_cache_blocks,
+            help="(ArkVale) Capacity of the pinned CPU KV pool, in blocks. "
+            "Has no effect unless --enable-arkvale-sparse-offload is set.",
+        )
+        vllm_group.add_argument(
+            "--arkvale-config",
+            type=str,
+            default=EngineArgs.arkvale_config,
+            help="(ArkVale) Path to a JSON file overriding any "
+            "ArkValeConfig fields. CLI flags above take precedence.",
+        )
         vllm_group.add_argument("--kv-events-config", **vllm_kwargs["kv_events_config"])
         vllm_group.add_argument(
             "--ec-transfer-config", **vllm_kwargs["ec_transfer_config"]
@@ -2285,7 +2321,17 @@ class EngineArgs:
             shutdown_timeout=self.shutdown_timeout,
         )
         config.quest_config = _quest_config_from_args(self)
-        if config.quest_config is not None and config.quest_config.enabled:
+        config.arkvale_config = _arkvale_config_from_args(self)
+
+        quest_on = config.quest_config is not None and config.quest_config.enabled
+        arkvale_on = config.arkvale_config is not None and config.arkvale_config.enabled
+        if quest_on and arkvale_on:
+            raise ValueError(
+                "enable_quest_sparse_offload and "
+                "enable_arkvale_sparse_offload are mutually exclusive; "
+                "pick exactly one."
+            )
+        if quest_on or arkvale_on:
             if config.attention_config.backend is None:
                 config.attention_config.backend = AttentionBackendEnum.CUSTOM
             elif config.attention_config.backend != AttentionBackendEnum.CUSTOM:
@@ -2669,9 +2715,43 @@ def _quest_config_from_args(args: "EngineArgs") -> "QuestConfig | None":
         cfg = QuestConfig()
 
     cfg.enabled = cfg.enabled or enabled
-    if getattr(args, "quest_top_k", None) is not None:
-        cfg.top_k = args.quest_top_k
-    if getattr(args, "quest_cpu_cache_blocks", None) is not None:
-        cfg.cpu_cache_blocks = args.quest_cpu_cache_blocks
+    quest_top_k = getattr(args, "quest_top_k", None)
+    if quest_top_k is not None:
+        cfg.top_k = quest_top_k
+    quest_cpu_cache_blocks = getattr(args, "quest_cpu_cache_blocks", None)
+    if quest_cpu_cache_blocks is not None:
+        cfg.cpu_cache_blocks = quest_cpu_cache_blocks
+    cfg.validate()
+    return cfg
+
+
+def _arkvale_config_from_args(args: "EngineArgs") -> "ArkValeConfig | None":
+    """Translate EngineArgs into an ArkValeConfig instance.
+
+    Returns None when ArkVale is not enabled (gate is off and no config file).
+    """
+    from vllm.config.arkvale import ArkValeConfig
+
+    enabled = bool(getattr(args, "enable_arkvale_sparse_offload", False))
+    config_path = getattr(args, "arkvale_config", None)
+    if not enabled and not config_path:
+        return None
+
+    if config_path:
+        import json
+
+        with open(config_path) as f:
+            data = json.load(f)
+        cfg = ArkValeConfig.from_dict(data)
+    else:
+        cfg = ArkValeConfig()
+
+    cfg.enabled = cfg.enabled or enabled
+    arkvale_top_k = getattr(args, "arkvale_top_k", None)
+    if arkvale_top_k is not None:
+        cfg.top_k = arkvale_top_k
+    arkvale_cpu_cache_blocks = getattr(args, "arkvale_cpu_cache_blocks", None)
+    if arkvale_cpu_cache_blocks is not None:
+        cfg.cpu_cache_blocks = arkvale_cpu_cache_blocks
     cfg.validate()
     return cfg
