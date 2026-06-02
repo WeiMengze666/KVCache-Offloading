@@ -28,25 +28,76 @@ class ArkValeConfig:
     block_size: int = 32
     top_k: int = 64
     full_kv_layers: list[int] = field(default_factory=lambda: [0, 1])
+    digest_mode: DigestMode = "arkvale_cuboid_mean"
+    """Page digest formula. Differs from QuestConfig: defaults to 'arkvale_cuboid_mean'.
+    'quest_minmax' = true K amax/amin (Quest, default).
+    'arkvale_cuboid_mean' = center +/- mean(|K - center|) where
+    center = (true_max + true_min) / 2 (ArkVale cuboid-mean variant).
+
+    The digest tensor layout is identical for both modes — selection ops
+    and CPU offload are unaware of which formula produced the values."""
 
     # GPU/CPU tiering
     gpu_cache_blocks_per_seq: int = 256
     cpu_cache_blocks: int = 65536
     cpu_cache_gib: int | None = None
+    """Total pinned CPU pool budget in GiB across ALL ArkVale layers.
+
+    When set, the runtime computes `floor(cpu_cache_gib * 1024**3 /
+    page_size_bytes / num_quest_layers)` and takes the min with
+    `cpu_cache_blocks` (the legacy per-layer ceiling). When None, only the
+    legacy ceiling applies. Tighter constraint always wins.
+
+    Set this when host RAM is the binding constraint. The legacy ceiling
+    is kept for backwards compatibility with the Transformers-side
+    configuration."""
     eviction_policy: EvictionPolicy = "lru"
 
     # Async (Phase C)
     enable_async_prefetch: bool = False
+    """Phase C gate. When True, ensure_resident issues non_blocking=True H2D
+    on a dedicated h2d_stream and returns an event for the compute stream
+    to wait on before the kernel runs (Mode 1). When False, all transfers
+    are synchronous (Phase B behavior). Default False; flip to True to opt
+    in to async transfers."""
+
     enable_double_buffering: bool = False
+    """Phase C reserved. Currently unused — the Phase C design uses a single
+    h2d/d2h stream pair without staging buffers (each ArkVale layer has its
+    own GPU pool, so layer-N forward and H2D into layer-N+1 don't conflict).
+    Reserved for future expansion."""
+
     num_h2d_streams: int = 1
+    """Phase C reserved. Currently fixed at 1; multi-stream H2D is deferred."""
+
     num_d2h_streams: int = 1
+    """Phase C reserved. Currently fixed at 1."""
+
     prefetch_window_blocks: int = 0
+    """Mode 2 toggle. When > 0 and enable_async_prefetch=True, after layer N's
+    forward we speculatively prefetch layer N's top_ids into layer N+1's GPU
+    pool on the h2d_stream. Layer N+1's forward waits on the prefetch event
+    before starting.
+
+    .. warning::
+
+       Mode 2 carries a structural LRU-thrash risk. When the GPU pool is
+       full (steady state) and the speculative prefetch picks differ from
+       layer N+1's actual selection, every wrong prefetch evicts an LRU
+       block to CPU, and the actual selection then has to refetch it. In
+       the worst case (zero overlap between speculation and reality),
+       Mode 2 can be 2x slower than Mode 1.
+
+       ArkVale's cross-layer top-k overlap is workload-dependent and has
+       not been measured for this project. **Do not enable Mode 2
+       (prefetch_window_blocks > 0) in production without first
+       benchmarking the overlap fraction on your model.** Phase D may
+       add an overlap-threshold gate; until then, Mode 2 is best left
+       at 0.
+    """
 
     # Kernel
     selection_impl: SelectionImpl = "torch"
-
-    # Digest formula. ArkVale defaults to cuboid-mean.
-    digest_mode: DigestMode = "arkvale_cuboid_mean"
 
     # Debug
     enable_debug_counters: bool = False
@@ -92,6 +143,11 @@ class ArkValeConfig:
             raise ValueError(
                 f"full_kv_layers must be a list of int, got {self.full_kv_layers!r}"
             )
+        if self.digest_mode not in ("quest_minmax", "arkvale_cuboid_mean"):
+            raise ValueError(
+                f"digest_mode must be 'quest_minmax' or "
+                f"'arkvale_cuboid_mean', got {self.digest_mode!r}"
+            )
         if self.prefetch_window_blocks < 0:
             raise ValueError(
                 f"prefetch_window_blocks must be >= 0, "
@@ -99,12 +155,8 @@ class ArkValeConfig:
             )
         if self.prefetch_window_blocks > 0 and not self.enable_async_prefetch:
             raise ValueError(
-                "prefetch_window_blocks > 0 requires enable_async_prefetch=True."
-            )
-        if self.digest_mode not in ("quest_minmax", "arkvale_cuboid_mean"):
-            raise ValueError(
-                f"digest_mode must be 'quest_minmax' or "
-                f"'arkvale_cuboid_mean', got {self.digest_mode!r}"
+                "prefetch_window_blocks > 0 (Mode 2) requires "
+                "enable_async_prefetch=True (Mode 1)."
             )
 
     def to_dict(self) -> dict[str, Any]:
