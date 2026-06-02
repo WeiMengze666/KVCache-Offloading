@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Single-RunConfig subprocess body.
 
-Spawned by __main__.py (multiprocessing.spawn). Builds an LLM, runs the
-sampler in the background, generates each Sample from the workload, then
+Spawned by __main__.py (multiprocessing.spawn). Builds an LLM, probes memory
+at sample boundaries (no background sampling thread — the worker process's
+collective_rpc input socket is shared with the engine's request stream and
+concurrent sends from a separate thread cause IPC frame corruption), then
 flushes per-config CSV + summary JSON.
 """
 
@@ -12,7 +14,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import queue
 import sys
 import tempfile
 import time
@@ -23,7 +24,6 @@ from typing import Any
 from benchmarks.quest_memory_probe import probes
 from benchmarks.quest_memory_probe.configs import RunConfig
 from benchmarks.quest_memory_probe.csv_writer import write_rows
-from benchmarks.quest_memory_probe.sampler import Sampler
 from benchmarks.quest_memory_probe.summary import aggregate_samples
 from benchmarks.quest_memory_probe.workload import load_samples
 
@@ -111,7 +111,6 @@ def execute(cfg: RunConfig, out_dir: Path) -> None:
         from vllm import LLM, SamplingParams  # deferred import
 
         rows: list[dict[str, Any]] = []
-        q: queue.Queue = queue.Queue()
 
         with tempfile.TemporaryDirectory() as td:
             quest_json = (
@@ -120,8 +119,6 @@ def execute(cfg: RunConfig, out_dir: Path) -> None:
             kwargs = _make_engine_kwargs(cfg, quest_json_path=quest_json)
             llm = LLM(**kwargs)
 
-            # One-shot introspection for the log; helps debug if the
-            # collective_rpc probe later finds 0 tier_managers.
             try:
                 n_tm = llm.llm_engine.collective_rpc(
                     lambda w: len(probes._collect_tier_managers(w))
@@ -130,26 +127,49 @@ def execute(cfg: RunConfig, out_dir: Path) -> None:
             except Exception as e:
                 print(f"[runner] introspection failed: {e!r}")
 
-            # Cache bytes_per_block once; it's a function of layer geometry.
             try:
                 bpb = llm.llm_engine.collective_rpc(probes.probe_bytes_per_block)[0]
             except Exception as e:
                 print(f"[runner] bytes_per_block probe failed: {e!r}")
                 bpb = None
 
-            def snap():
-                return llm.llm_engine.collective_rpc(
-                    probes.probe_snapshot,
-                    args=(bpb,),
-                )[0]
+            def take_snapshot(phase: str, **extra: Any) -> None:
+                """Probe once and append a row tagged `phase`. Catches probe
+                failures so generation continues even if a single RPC fails.
+                """
+                try:
+                    snap = llm.llm_engine.collective_rpc(
+                        probes.probe_snapshot,
+                        args=(bpb,),
+                    )[0]
+                except Exception as e:
+                    snap = {"error": repr(e)}
+                snap["ts_ms"] = _now_ms()
+                snap["phase"] = phase
+                snap.update(extra)
+                rows.append(snap)
 
             rows.append({"ts_ms": _now_ms(), "phase": "engine_init_done"})
-            sampler = Sampler(
-                snapshot_fn=snap,
-                interval_s=cfg.probe_interval_ms / 1000.0,
-                queue_=q,
+            # Initial baseline snapshot inside a synthetic "warmup" window so
+            # the aggregator records a steady-state pre-generation point.
+            rows.append(
+                {
+                    "ts_ms": _now_ms(),
+                    "phase": "sample_start",
+                    "sample_id": "_warmup",
+                    "prompt_tokens": 0,
+                }
             )
-            sampler.start()
+            take_snapshot("sampling")
+            rows.append(
+                {
+                    "ts_ms": _now_ms(),
+                    "phase": "sample_end",
+                    "sample_id": "_warmup",
+                    "gen_tokens": 0,
+                    "latency_s": 0.0,
+                }
+            )
 
             params = SamplingParams(
                 temperature=0.0,
@@ -167,11 +187,19 @@ def execute(cfg: RunConfig, out_dir: Path) -> None:
                         "prompt_tokens": s.prompt_tokens,
                     }
                 )
+                # Probe once at sample start (before peak counter reset). This
+                # falls into the active window because we just emitted
+                # sample_start above.
+                take_snapshot("sampling")
                 try:
                     llm.llm_engine.collective_rpc(probes.reset_peak_stats)
                     t0 = time.perf_counter()
                     out = llm.generate([s.prompt], params, use_tqdm=False)[0]
                     elapsed = time.perf_counter() - t0
+                    # Probe immediately after generate so the post-decode
+                    # state (peak resident, hit ratio, slack) lands in this
+                    # sample's window.
+                    take_snapshot("sampling")
                     rows.append(
                         {
                             "ts_ms": _now_ms(),
@@ -196,13 +224,6 @@ def execute(cfg: RunConfig, out_dir: Path) -> None:
                     )
                     if cfg.name.endswith("_oom") and consecutive_oom >= 2:
                         break
-
-            sampler.stop()
-            sampler.join(timeout=5.0)
-
-            while not q.empty():
-                rows.append(q.get_nowait())
-            rows.sort(key=lambda r: r.get("ts_ms", 0))
 
             rows.append({"ts_ms": _now_ms(), "phase": "teardown"})
             _teardown(llm)
@@ -246,3 +267,12 @@ def _teardown(llm) -> None:
         torch.accelerator.empty_cache()
     except Exception:
         pass
+
+
+def run_in_child(cfg_dict: dict, out_dir_str: str) -> None:
+    """Spawn target. Defined in `runner` (not `__main__`) so multiprocessing.spawn
+    can re-import it across the pickling boundary when the parent was launched
+    via `python -m benchmarks.quest_memory_probe`.
+    """
+    cfg = RunConfig.from_dict(cfg_dict)
+    execute(cfg, Path(out_dir_str))
