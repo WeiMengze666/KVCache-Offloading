@@ -334,8 +334,11 @@ def test_bind_runtime_attaches_quest_refs_to_layers(cuda):
 
 
 def test_bind_runtime_does_not_attach_refs_when_async_disabled(cuda):
-    """When stream_pool is None (sync mode), no Mode 2 refs needed.
-    Don't pollute layer attribute namespace."""
+    """When stream_pool is None (sync mode), no Mode-2 prefetch refs are
+    attached. _quest_config_ref IS attached on every Quest layer regardless of
+    async mode — the Stage 2C-v2 footprint_kvshare forward path reads it to
+    decide whether to take the Quest-owned-write path (it must work in the
+    default sync mode too). The Mode-2-only registry stays absent."""
     from vllm.config.quest import QuestConfig
     from vllm.v1.attention.backends.quest.backend import (
         QuestSparseOffloadBackend,
@@ -368,8 +371,9 @@ def test_bind_runtime_does_not_attach_refs_when_async_disabled(cuda):
         kv_caches=fake_kv,
         layers=layers_dict,
     )
-    # No refs attached → Mode 2 helpers naturally return None.
-    assert not hasattr(layers_dict["layer.1"], "_quest_config_ref")
+    # _quest_config_ref IS attached now (footprint_kvshare needs it in sync
+    # mode); only the Mode-2 prefetch registry stays absent.
+    assert layers_dict["layer.1"]._quest_config_ref is quest_cfg
     assert not hasattr(layers_dict["layer.1"], "_quest_layer_tm_registry")
 
 

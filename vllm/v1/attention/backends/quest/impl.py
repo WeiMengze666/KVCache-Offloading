@@ -105,19 +105,30 @@ class QuestSparseOffloadImpl(AttentionImpl):
             # the engine via do_kv_cache_update (forward_includes_kv_cache_update
             # is False) before this forward ran, so FA forward only reads.
             #
-            # Stage 2C-v2 (footprint_kvshare): for a SHARED Quest layer the
-            # engine SKIPS do_kv_cache_update (kv_sharing_target guard), so the
-            # scratch tensor (== kv_cache here) is unwritten. We must write this
-            # layer's K/V into the scratch ourselves BEFORE delegating to FA, so
-            # FA prefill reads correct KV. The slot_mapping already targets the
-            # scratch slots (folded into the scratch group). Full-KV layers and
-            # the non-kvshare path are untouched (engine already wrote).
-            is_kvshare = (
+            # Stage 2C-v2 (footprint_kvshare): under kv-share EVERY Quest layer
+            # (the scratch layer AND the layers sharing to it) loses its own
+            # per-layer engine cache — they all alias ONE scratch tensor that is
+            # overwritten by each subsequent Quest layer within the same forward
+            # pass. So the 2A path (defer arena population to a decode-time trim
+            # that reads the engine cache) is wrong for ALL of them: by decode
+            # the scratch holds the LAST Quest layer's KV. Every Quest layer must
+            # therefore offload from its OWN key/value at prefill time.
+            #
+            # Only the SHARED (non-scratch) layers additionally need us to WRITE
+            # the scratch before FA prefill — the engine skips do_kv_cache_update
+            # for them (kv_sharing_target guard). The scratch layer's own engine
+            # write already happened (it has no share target), so we must NOT
+            # double-write it.
+            kvshare_layer = (
                 not full_kv
+                and self._is_footprint_kvshare_layer(layer)
+            )
+            kvshare_write = (
+                kvshare_layer
                 and is_prefill
                 and self._is_kvshare_shared_layer(layer)
             )
-            if is_kvshare:
+            if kvshare_write:
                 self._kvshare_write_scratch(layer, key, value, kv_cache,
                                             attn_metadata)
             out = self._fa_impl.forward(
@@ -131,10 +142,12 @@ class QuestSparseOffloadImpl(AttentionImpl):
                 output_scale=output_scale,
                 output_block_scale=output_block_scale,
             )
-            if is_kvshare:
+            if kvshare_layer and is_prefill:
                 # Quest-owned per-layer offload, sourced from key/value (NOT the
                 # scratch, which the next layer overwrites). Establishes the
-                # bounded working set + summaries at prefill time.
+                # bounded working set + summaries at prefill time. Applies to the
+                # scratch layer too (its scratch slot is overwritten by later
+                # layers before decode).
                 self._kvshare_prefill_offload(layer, key, value, attn_metadata)
             else:
                 # During prefill, hand newly completed blocks to the tier manager
@@ -154,11 +167,12 @@ class QuestSparseOffloadImpl(AttentionImpl):
         # sparse path — no manual reshape_and_cache_flash here (that would
         # double-write).
         #
-        # Stage 2C-v2: for a SHARED layer the engine wrote NOTHING (kv-share),
-        # so the arena live block must be filled from this step's key/value, not
-        # read back from the scratch. The sparse gather still reads only the
-        # arena, so only the WRITE side changes.
-        if not full_kv and self._is_kvshare_shared_layer(layer):
+        # Stage 2C-v2: for EVERY kv-share Quest layer (scratch + shared) the
+        # arena live block must be filled from this step's key/value, not read
+        # back from the scratch (which later Quest layers overwrite this same
+        # step). The sparse gather still reads only the arena, so only the WRITE
+        # side changes.
+        if not full_kv and self._is_footprint_kvshare_layer(layer):
             self._kvshare_decode_write(layer, key, value, attn_metadata)
         else:
             self._notify_filled_blocks_after_decode(
@@ -236,6 +250,20 @@ class QuestSparseOffloadImpl(AttentionImpl):
         owns it. False (the 2A/2B path) when footprint_kvshare is off or the
         layer keeps its own KV (full-KV layers, the scratch layer)."""
         if getattr(layer, "kv_sharing_target_layer_name", None) is None:
+            return False
+        qc = getattr(layer, "_quest_config_ref", None)
+        return bool(qc is not None and getattr(qc, "footprint_kvshare", False))
+
+    def _is_footprint_kvshare_layer(self, layer) -> bool:
+        """True iff footprint_kvshare is on AND this is a Quest layer (has a
+        tier_manager). This is BROADER than _is_kvshare_shared_layer: it ALSO
+        includes the scratch layer (the kv-share target, whose own
+        kv_sharing_target is None). Under kv-share the scratch layer loses its
+        per-layer engine cache too — all Quest layers alias one scratch tensor
+        overwritten within each forward pass — so EVERY Quest layer must do the
+        key/value-sourced offload, not the 2A engine-cache-sourced path. Only
+        the WRITE of the scratch (kvshare_write_scratch) is shared-layer-only."""
+        if getattr(layer, "tier_manager", None) is None:
             return False
         qc = getattr(layer, "_quest_config_ref", None)
         return bool(qc is not None and getattr(qc, "footprint_kvshare", False))
