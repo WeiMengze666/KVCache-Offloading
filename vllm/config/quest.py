@@ -7,6 +7,7 @@ later phases can flip them without re-introducing config-shape churn — but
 they are validated and have safe defaults that keep Phase A behavior equal to
 FlashAttention with the gate flipped.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -15,6 +16,7 @@ from typing import Any, Literal
 EvictionPolicy = Literal["lru", "arc"]
 SelectionImpl = Literal["torch", "triton", "cuda"]
 UnsupportedModelPolicy = Literal["error", "fallback"]
+DigestMode = Literal["quest_minmax", "arkvale_cuboid_mean"]
 
 
 @dataclass
@@ -26,6 +28,13 @@ class QuestConfig:
     block_size: int = 32
     top_k: int = 64
     full_kv_layers: list[int] = field(default_factory=lambda: [0, 1])
+    digest_mode: DigestMode = "quest_minmax"
+    """Page digest formula. 'quest_minmax' = true K amax/amin (Quest, default).
+    'arkvale_cuboid_mean' = center +/- mean(|K - center|) where
+    center = (true_max + true_min) / 2 (ArkVale cuboid-mean variant).
+
+    The digest tensor layout is identical for both modes — selection ops
+    and CPU offload are unaware of which formula produced the values."""
 
     # GPU/CPU tiering (Phase B activates these).
     gpu_cache_blocks_per_seq: int = 256
@@ -104,22 +113,18 @@ class QuestConfig:
                 f"gpu_cache_blocks_per_seq ({self.gpu_cache_blocks_per_seq})"
             )
         if self.block_size <= 0:
-            raise ValueError(
-                f"block_size must be positive, got {self.block_size}"
-            )
+            raise ValueError(f"block_size must be positive, got {self.block_size}")
         if self.cpu_cache_blocks < 0:
             raise ValueError(
                 f"cpu_cache_blocks must be >= 0, got {self.cpu_cache_blocks}"
             )
         if self.cpu_cache_gib is not None and self.cpu_cache_gib <= 0:
             raise ValueError(
-                f"cpu_cache_gib must be positive when set, "
-                f"got {self.cpu_cache_gib}"
+                f"cpu_cache_gib must be positive when set, got {self.cpu_cache_gib}"
             )
         if self.eviction_policy not in ("lru", "arc"):
             raise ValueError(
-                f"eviction_policy must be 'lru' or 'arc', "
-                f"got {self.eviction_policy!r}"
+                f"eviction_policy must be 'lru' or 'arc', got {self.eviction_policy!r}"
             )
         if self.selection_impl not in ("torch", "triton", "cuda"):
             raise ValueError(
@@ -135,8 +140,12 @@ class QuestConfig:
             isinstance(x, int) for x in self.full_kv_layers
         ):
             raise ValueError(
-                f"full_kv_layers must be a list of int, "
-                f"got {self.full_kv_layers!r}"
+                f"full_kv_layers must be a list of int, got {self.full_kv_layers!r}"
+            )
+        if self.digest_mode not in ("quest_minmax", "arkvale_cuboid_mean"):
+            raise ValueError(
+                f"digest_mode must be 'quest_minmax' or "
+                f"'arkvale_cuboid_mean', got {self.digest_mode!r}"
             )
         if self.prefetch_window_blocks < 0:
             raise ValueError(
@@ -153,19 +162,19 @@ class QuestConfig:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "QuestConfig":
+    def from_dict(cls, data: dict[str, Any]) -> QuestConfig:
         return cls(**data)
 
     def resolve_cpu_blocks_per_layer(
-        self, *, page_size_bytes: int, num_quest_layers: int,
+        self,
+        *,
+        page_size_bytes: int,
+        num_quest_layers: int,
     ) -> int:
         if num_quest_layers <= 0:
             return 0
         legacy_cap = self.cpu_cache_blocks
         if self.cpu_cache_gib is None:
             return legacy_cap
-        gib_cap = (
-            self.cpu_cache_gib * (1024 ** 3) // page_size_bytes
-            // num_quest_layers
-        )
+        gib_cap = self.cpu_cache_gib * (1024**3) // page_size_bytes // num_quest_layers
         return min(legacy_cap, gib_cap)
