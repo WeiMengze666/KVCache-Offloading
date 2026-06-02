@@ -76,7 +76,7 @@ def _write_quest_config_json(cfg: RunConfig, dir_: Path) -> str:
         full_kv_layers=list(cfg.full_kv_layers),
         gpu_cache_blocks_per_seq=cfg.gpu_cache_blocks_per_seq,
         cpu_cache_blocks=cfg.cpu_cache_blocks,
-        cpu_cache_gib=cfg.cpu_cache_gib,
+        cpu_cache_gib=int(cfg.cpu_cache_gib) if cfg.cpu_cache_gib > 0 else None,
         selection_impl=cfg.selection_impl,
         enable_async_prefetch=False,
     )

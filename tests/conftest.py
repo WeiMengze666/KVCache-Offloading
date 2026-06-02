@@ -1497,16 +1497,6 @@ def pytest_addoption(parser):
 
 
 def pytest_collection_modifyitems(config, items):
-    # Skip real_model tests unless -m real_model is explicitly passed.
-    markexpr = config.option.markexpr if hasattr(config.option, "markexpr") else ""
-    if "real_model" not in markexpr:
-        skip_real_model = pytest.mark.skip(
-            reason="need -m real_model to run (requires GPU + real model weights)"
-        )
-        for item in items:
-            if "real_model" in item.keywords:
-                item.add_marker(skip_real_model)
-
     if config.getoption("--optional"):
         # --optional given in cli: do not skip optional tests
         return

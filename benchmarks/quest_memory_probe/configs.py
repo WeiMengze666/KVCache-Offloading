@@ -29,8 +29,8 @@ class RunConfig:
     quest_enabled: bool = False
     top_k: int = 0
     gpu_cache_blocks_per_seq: int = 0
-    cpu_cache_blocks: int = 0
-    cpu_cache_gib: float = 0.0
+    cpu_cache_blocks: int = 8192
+    cpu_cache_gib: float = 8.0
     selection_impl: str = "torch"
     full_kv_layers: tuple[int, ...] = field(default_factory=tuple)
     # Probe

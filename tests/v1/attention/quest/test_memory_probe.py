@@ -886,6 +886,11 @@ class TestE2ESmoke:
         Forces synthetic prompts so the test does not depend on LongBench
         downloads. Only enabled when pytest is invoked with -m real_model.
         """
+        import torch
+
+        if not torch.cuda.is_available():
+            pytest.skip("smoke test requires CUDA")
+
         monkeypatch.setenv("QUEST_MEM_PROBE_FORCE_SYNTHETIC", "1")
         monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
