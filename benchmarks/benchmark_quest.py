@@ -171,6 +171,10 @@ class RunConfig:
     # When False this is the 2A write-back path. offload then manifests as
     # evict_drop>0 (not evict_d2h>0).
     enable_write_through: bool = False
+    # Stage 2C-v2: footprint reduction via kv-share eviction. When True the
+    # non-full-KV Quest layers leave HMA (reserve zero blocks); offload_mode is
+    # tagged "kvshare" for the footprint diff against 2A's "real".
+    footprint_kvshare: bool = False
     # Expect offload to trigger (asserted in-worker for the small-budget point).
     expect_offload: bool = False
     # Cross-version ablation label. Stage 1 is the offload-bypassed baseline;
@@ -312,6 +316,12 @@ def _probe_memory(worker) -> dict:
     weights = int(getattr(getattr(worker, "model_runner", None),
                           "model_memory_usage", 0) or 0)
     kv_reserved = int(getattr(worker, "available_kv_cache_memory_bytes", 0) or 0)
+    # Stage 2C-v2 footprint metric: blocks the engine actually reserved. Under
+    # footprint_kvshare the Quest layers reserve zero, so this rebounds vs 2A at
+    # the same util (the kv-share lever); at a fixed context it lets util drop.
+    num_gpu_blocks = int(
+        getattr(getattr(worker, "cache_config", None), "num_gpu_blocks", 0) or 0
+    )
     return {
         "total_bytes": int(total),
         "cuda_used_bytes": int(cuda_used),       # real device footprint
@@ -320,6 +330,7 @@ def _probe_memory(worker) -> dict:
         "non_torch_bytes": int(cuda_used - torch_reserved),
         "weights_bytes": weights,
         "kv_reserved_bytes": kv_reserved,
+        "num_gpu_blocks": num_gpu_blocks,
         # derived activation estimate (peak alloc minus weights), clamped >=0
         "activation_peak_bytes": max(0, int(torch_peak) - weights),
     }
@@ -400,6 +411,7 @@ def _engine_worker(cfg_dict: dict, tmp_dir: str, out_path: str) -> None:
                 selection_impl=cfg.selection_impl,
                 enable_async_prefetch=False,
                 enable_write_through=cfg.enable_write_through,
+                footprint_kvshare=cfg.footprint_kvshare,
                 # Two-pass: debug counters (cuda-Event timing, overlap buffer,
                 # NVTX) ON only for the instrumented pass; OFF on the clean pass
                 # so latency/throughput are unperturbed.
@@ -677,7 +689,8 @@ _CSV_COLS = [
     "name", "quest_enabled", "pass_kind", "prompt_tokens", "gen_tokens",
     "latency_s",
     "decode_tokens_per_s",
-    "cuda_used_gib", "weights_gib", "kv_reserved_gib",
+    "cuda_used_gib", "weights_gib", "kv_reserved_gib", "num_gpu_blocks",
+    "gpu_memory_utilization",
     "cosine_vs_dense_mean", "cosine_vs_dense_min",
     "gpu_cache_blocks_per_seq", "top_k",
     "block_filled", "evict_d2h", "evict_drop", "load_h2d",
@@ -715,6 +728,8 @@ def _csv_row(r: dict) -> dict:
         "cuda_used_gib": round(mem.get("cuda_used_bytes", 0) / _gib, 3),
         "weights_gib": round(mem.get("weights_bytes", 0) / _gib, 3),
         "kv_reserved_gib": round(mem.get("kv_reserved_bytes", 0) / _gib, 3),
+        "num_gpu_blocks": mem.get("num_gpu_blocks", 0),
+        "gpu_memory_utilization": cfg.get("gpu_memory_utilization", 0),
         "cosine_vs_dense_mean": round(r.get("cosine_vs_dense_mean", 1.0), 5),
         "cosine_vs_dense_min": round(r.get("cosine_vs_dense_min", 1.0), 5),
         "gpu_cache_blocks_per_seq": cfg.get("gpu_cache_blocks_per_seq", 0),
@@ -833,7 +848,31 @@ def build_run_plan(args) -> list[RunConfig]:
     # prompt's candidate-block count (--large-gpu-blocks); the impl clamps via
     # min(top_k, full_blocks) at impl_helpers.py so a large value == "all blocks".
     sweep = _parse_topk_sweep(args.top_k_sweep, args.large_gpu_blocks)
-    if sweep:
+    fsweep = _parse_footprint_sweep(getattr(args, "footprint_sweep", ""))
+    if fsweep:
+        # Stage 2C-v2 footprint curve: for each util, a 2A point (Quest in HMA)
+        # and a kvshare point (Quest out of HMA). LARGE gpu budget so neither
+        # force-spills — we isolate the HMA footprint lever (num_gpu_blocks /
+        # kv_reserved), not arena overflow. Quest config is the alignment-safe
+        # one (top_k large, full_kv_layers default).
+        fcommon = dict(common)
+        fcommon.pop("gpu_memory_utilization")
+        base = []
+        for util in fsweep:
+            base.append(RunConfig(
+                name=f"quest_hma_u{util:.2f}", quest_enabled=True,
+                gpu_cache_blocks_per_seq=args.large_gpu_blocks,
+                gpu_memory_utilization=util,
+                expect_offload=False, offload_mode="real", **fcommon,
+            ))
+            base.append(RunConfig(
+                name=f"quest_kvshare_u{util:.2f}", quest_enabled=True,
+                gpu_cache_blocks_per_seq=args.large_gpu_blocks,
+                gpu_memory_utilization=util,
+                expect_offload=False, offload_mode="kvshare",
+                footprint_kvshare=True, **fcommon,
+            ))
+    elif sweep:
         sweep_common = dict(common)
         sweep_common.pop("top_k")  # set per sweep point below
         base = [RunConfig(name="dense", quest_enabled=False, **sweep_common)]
@@ -897,6 +936,26 @@ def _parse_topk_sweep(spec: str, large_gpu_blocks: int) -> list[tuple[str, int]]
         seen.add(label)
         k = large_gpu_blocks if label == "ALL" else int(tok)
         out.append((label, k))
+    return out
+
+
+def _parse_footprint_sweep(spec: str) -> list[float]:
+    """Parse the --footprint-sweep comma list into gpu_memory_utilization
+    floats, preserving order and de-duplicating. Empty/blank -> [] (no
+    footprint sweep). Each value must be in (0, 1]."""
+    out: list[float] = []
+    seen: set[float] = set()
+    for tok in (spec or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        u = float(tok)
+        if not (0.0 < u <= 1.0):
+            raise ValueError(f"footprint-sweep util must be in (0,1], got {u}")
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
     return out
 
 
@@ -965,6 +1024,17 @@ def parse_args(argv=None):
                         "instrumented pass compare evict_stall_ms write-back vs "
                         "write-through (mechanism only — end-to-end overlap also "
                         "needs Stage 3 prefetch ordering).")
+    p.add_argument("--footprint-sweep", default="",
+                   help="Stage 2C-v2: comma list of gpu_memory_utilization "
+                        "values (e.g. '0.50,0.30,0.20'). For each util, emit a "
+                        "2A point (offload_mode=real, Quest layers in HMA) and a "
+                        "kvshare point (offload_mode=kvshare, Quest routed out of "
+                        "HMA via footprint_kvshare). Recorded num_gpu_blocks / "
+                        "kv_reserved_gib at a FIXED context is the footprint "
+                        "curve: kvshare rebounds num_blocks at the same util, so "
+                        "the same context fits at much lower util (where "
+                        "footprint actually drops). Uses the LARGE gpu budget so "
+                        "neither point force-spills (isolates the HMA lever).")
     p.add_argument("--profile", action="store_true",
                    help="wrap the INSTRUMENTED-pass worker under `nsys profile` "
                         "(never the clean pass — nsys perturbs timing) so the "
