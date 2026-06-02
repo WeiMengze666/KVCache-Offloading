@@ -371,3 +371,64 @@ def test_trim_keeps_cap_minus_one_and_spills_rest():
     slot3 = tm.logical_to_slot(0, 3)
     assert torch.equal(tm.gpu_k[slot3], engine[3, 0])
     assert tm.stats().load_h2d == 1
+
+
+def test_write_through_mirrors_at_fill_and_drops_on_evict():
+    """Stage 2B write-through: every full block is mirrored to a durable host
+    slot AT FILL; eviction only drops the GPU slot (no D2H, counts as
+    evict_drop); a reloaded block reads back bit-equal and its host backup
+    survives the reload (durable)."""
+    tm = _build(gpu_budget=2, cpu_budget=8, enable_write_through=True)
+    vals = {}
+
+    def blk(v):
+        return torch.full((4, 1, 8), float(v), dtype=torch.float16,
+                          device="cuda")
+
+    # Fill cap+1 = 3 blocks → one eviction (LRU block 0).
+    for b in range(3):
+        k, v = blk(b), blk(b + 100)
+        vals[b] = (k.clone(), v.clone())
+        tm.on_block_filled(seq_id=0, logical_block_id=b, k_block=k, v_block=v)
+
+    from vllm.v1.attention.backends.quest.cache.residency import (
+        ResidencyState,
+    )
+    # Every filled block has a durable host backup (mirrored at fill).
+    assert set(tm._host_slots) == {(0, 0), (0, 1), (0, 2)}
+    # Eviction of the LRU dropped the GPU slot — no D2H, counted as evict_drop.
+    assert tm.stats().evict_drop == 1
+    assert tm.stats().evict_d2h == 0
+    assert tm.residency.state(0, 0) == ResidencyState.ON_CPU
+
+    # Reload the evicted block from its durable host backup: bit-equal, and the
+    # host slot is NOT freed (stays the backup for the next eviction).
+    tm.ensure_resident(seq_id=0,
+                       logical_block_ids=torch.tensor([0], device="cuda"))
+    slot = tm.logical_to_slot(0, 0)
+    assert torch.equal(tm.gpu_k[slot], vals[0][0])
+    assert torch.equal(tm.gpu_v[slot], vals[0][1])
+    assert (0, 0) in tm._host_slots  # durable: survives reload
+    assert tm.stats().load_h2d == 1
+
+
+def test_write_through_off_is_byte_for_byte_writeback():
+    """enable_write_through=False ⇒ no _host_slots, eviction is D2H
+    (evict_d2h), reload pops+frees the CPU slot (2A behavior intact)."""
+    tm = _build(gpu_budget=2, cpu_budget=8, enable_write_through=False)
+
+    def blk(v):
+        return torch.full((4, 1, 8), float(v), dtype=torch.float16,
+                          device="cuda")
+
+    for b in range(3):
+        tm.on_block_filled(seq_id=0, logical_block_id=b,
+                           k_block=blk(b), v_block=blk(b + 100))
+    assert tm._host_slots == {}
+    assert tm.stats().evict_d2h == 1
+    assert tm.stats().evict_drop == 0
+    # 2A reload pops the transient _cpu_slots entry and frees it.
+    assert (0, 0) in tm._cpu_slots
+    tm.ensure_resident(seq_id=0,
+                       logical_block_ids=torch.tensor([0], device="cuda"))
+    assert (0, 0) not in tm._cpu_slots

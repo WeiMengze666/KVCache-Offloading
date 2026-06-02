@@ -99,6 +99,7 @@ class TierManager:
         enable_overlap_capture: bool = False,
         gpu_pool_aliases_kv_cache: bool = False,
         engine_kv_cache: torch.Tensor | None = None,
+        enable_write_through: bool = False,
     ) -> None:
         self.layer_idx = layer_idx
         self.gpu_budget = gpu_budget
@@ -145,8 +146,17 @@ class TierManager:
         self.enable_overlap_capture = enable_overlap_capture
 
         self._slot_map = _LRUSlotMap(capacity=gpu_budget)
-        # Per-evicted (seq_id, logical_block_id) -> cpu_slot
+        # Per-evicted (seq_id, logical_block_id) -> cpu_slot. Write-back (2A):
+        # transient — populated at eviction, popped+freed at reload. This stays
+        # the write-back map; write-through uses _host_slots instead (below).
         self._cpu_slots: dict[tuple[int, int], int] = {}
+        # Stage 2B write-through: DURABLE host backups, keyed the same way but
+        # independent of GPU residency. A block is mirrored here ONCE at fill
+        # time; eviction just drops the GPU slot (the backup persists), and a
+        # miss H2D-loads from here WITHOUT freeing the backup. Empty (and unused)
+        # when write-through is off.
+        self.enable_write_through = enable_write_through
+        self._host_slots: dict[tuple[int, int], int] = {}
         self._stats = QuestStats()
         # Debug-only per-(step, seq) selected block-id log (overlap capture).
         self._selected_log: list[dict] = []
@@ -158,7 +168,12 @@ class TierManager:
         # to host on a d2h_stream at fill time instead of at eviction time.
         # All eviction call sites (on_block_filled, _ensure_one_sync,
         # _ensure_one_async) route their spill through this attribute.
-        self.spill_hook = self._spill_to_cpu
+        if enable_write_through:
+            # Eviction = drop the GPU slot; the durable host backup already
+            # exists (mirrored at fill). No alloc, no D2H.
+            self.spill_hook = self._drop_gpu_slot
+        else:
+            self.spill_hook = self._spill_to_cpu
 
     def stats(self) -> QuestStats:
         return self._stats
@@ -261,6 +276,11 @@ class TierManager:
         self.gpu_v[slot].copy_(v_block, non_blocking=False)
         self.residency.mark_on_gpu(self.layer_idx, logical_block_id)
         self._stats.block_filled += 1
+        # Stage 2B write-through: mirror this full block to a durable host slot
+        # AT FILL (idempotent). A full block is immutable once filled, so the
+        # mirror is forever valid. No-op when write-through is off.
+        if self.enable_write_through:
+            self._mirror_to_host(seq_id, logical_block_id, k_block, v_block)
         return slot
 
     def trim_to_working_set(
@@ -294,6 +314,17 @@ class TierManager:
                 self.gpu_k[slot].copy_(k_eng[phys])
                 self.gpu_v[slot].copy_(v_eng[phys])
                 self.residency.mark_on_gpu(self.layer_idx, b)
+                # Write-through: the kept block also gets a durable host mirror
+                # (immutable once filled) so a later eviction can just drop it.
+                if self.enable_write_through:
+                    self._mirror_to_host(seq_id, b, k_eng[phys], v_eng[phys])
+            elif self.enable_write_through:
+                # Write-through: spilled prompt block goes straight to a durable
+                # host backup; no GPU slot, no transient _cpu_slots entry. A
+                # later select reloads it H2D from _host_slots (no free).
+                self._mirror_to_host(seq_id, b, k_eng[phys], v_eng[phys])
+                self.residency.begin_evict(self.layer_idx, b)
+                self.residency.complete_evict(self.layer_idx, b)
             else:
                 try:
                     cpu_slot = self.cpu_store.alloc(self.layer_idx)
@@ -382,6 +413,14 @@ class TierManager:
         cpu_keys = [k for k in self._cpu_slots if k[0] == seq_id]
         for k in cpu_keys:
             cpu_slot = self._cpu_slots.pop(k)
+            self.cpu_store.free(self.layer_idx, cpu_slot)
+            evicted_blocks.append(k[1])
+        # 2b. Write-through durable host backups. These persist across the
+        # sequence (not popped at reload), so they MUST be released here or the
+        # CPU pool exhausts after enough requests.
+        host_keys = [k for k in self._host_slots if k[0] == seq_id]
+        for k in host_keys:
+            cpu_slot = self._host_slots.pop(k)
             self.cpu_store.free(self.layer_idx, cpu_slot)
             evicted_blocks.append(k[1])
         # 3. trimmed marker.
@@ -477,7 +516,12 @@ class TierManager:
         if key in self._slot_map:
             self._slot_map.get(key)
             return
-        cpu_slot = self._cpu_slots.pop(key, None)
+        if self.enable_write_through:
+            # Durable backup: peek (do NOT pop/free) so it survives for the
+            # next eviction-as-drop.
+            cpu_slot = self._host_slots.get(key, None)
+        else:
+            cpu_slot = self._cpu_slots.pop(key, None)
         if cpu_slot is None:
             raise RuntimeError(f"block {key} is neither on GPU nor in CPU pool")
         slot, evicted = self._slot_map.add(key)
@@ -490,7 +534,8 @@ class TierManager:
             self.gpu_k[slot],
             self.gpu_v[slot],
         )
-        self.cpu_store.free(self.layer_idx, cpu_slot)
+        if not self.enable_write_through:
+            self.cpu_store.free(self.layer_idx, cpu_slot)
         self.residency.complete_load(self.layer_idx, bid)
         self._stats.load_h2d += 1
 
@@ -501,7 +546,10 @@ class TierManager:
         if key in self._slot_map:
             self._slot_map.get(key)
             return
-        cpu_slot = self._cpu_slots.pop(key, None)
+        if self.enable_write_through:
+            cpu_slot = self._host_slots.get(key, None)
+        else:
+            cpu_slot = self._cpu_slots.pop(key, None)
         if cpu_slot is None:
             raise RuntimeError(f"block {key} is neither on GPU nor in CPU pool")
         slot, evicted = self._slot_map.add(key)
@@ -527,9 +575,64 @@ class TierManager:
             self.gpu_v[slot],
             non_blocking=True,
         )
-        self.cpu_store.free(self.layer_idx, cpu_slot)
+        if not self.enable_write_through:
+            self.cpu_store.free(self.layer_idx, cpu_slot)
         self.residency.complete_load(self.layer_idx, bid)
         self._stats.load_h2d += 1
+
+    def _mirror_to_host(
+        self,
+        seq_id: int,
+        logical_block_id: int,
+        k_block: torch.Tensor,
+        v_block: torch.Tensor,
+    ) -> None:
+        """Stage 2B write-through: copy a FULL block into a durable host slot
+        at fill time. Idempotent — a block is mirrored exactly once (a full
+        block is immutable once filled, so the first mirror is forever valid).
+        Async on d2h_stream when a stream_pool is present (overlaps later-layer
+        compute), else a synchronous D2H. NEVER called for the live partial
+        block (it mutates every step); only full blocks via on_block_filled /
+        trim's kept+spilled branches.
+        """
+        key = (seq_id, logical_block_id)
+        if key in self._host_slots:
+            return
+        cpu_slot = self.cpu_store.alloc(self.layer_idx)
+        self._host_slots[key] = cpu_slot
+        if self.stream_pool is None:
+            self.cpu_store.store_block(
+                self.layer_idx, cpu_slot, k_block, v_block,
+            )
+        else:
+            d2h = self.stream_pool.d2h_stream
+            k_block.record_stream(d2h)
+            v_block.record_stream(d2h)
+            with torch.cuda.stream(d2h):
+                self.cpu_store.store_block(
+                    self.layer_idx, cpu_slot, k_block, v_block,
+                    non_blocking=True,
+                )
+
+    def _drop_gpu_slot(
+        self,
+        seq_id: int,
+        logical_block_id: int,
+        *,
+        slot: int,
+    ) -> None:
+        """Stage 2B write-through spill_hook: the durable host backup already
+        exists (mirrored at fill), so eviction just drops the GPU slot — no
+        alloc, no D2H. Marks the block ON_CPU and counts evict_drop.
+        """
+        key = (seq_id, logical_block_id)
+        assert key in self._host_slots, (
+            f"write-through evicting {key} with no durable host backup; "
+            f"a full block must be mirrored at fill before it can be dropped"
+        )
+        self.residency.begin_evict(self.layer_idx, logical_block_id)
+        self.residency.complete_evict(self.layer_idx, logical_block_id)
+        self._stats.evict_drop += 1
 
     def _spill_to_cpu(
         self,
