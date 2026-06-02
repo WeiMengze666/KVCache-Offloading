@@ -167,6 +167,10 @@ class RunConfig:
     cpu_cache_gib: int = 8
     selection_impl: str = "torch"
     full_kv_layers: list[int] = field(default_factory=lambda: [0, 1])
+    # Stage 2B: write-through D2H (mirror at fill, drop-evict, H2D-only miss).
+    # When False this is the 2A write-back path. offload then manifests as
+    # evict_drop>0 (not evict_d2h>0).
+    enable_write_through: bool = False
     # Expect offload to trigger (asserted in-worker for the small-budget point).
     expect_offload: bool = False
     # Cross-version ablation label. Stage 1 is the offload-bypassed baseline;
@@ -221,7 +225,7 @@ def _probe_quest_layers(model):
 def _aggregate_stats(per_layer: list[dict]) -> dict[str, float]:
     """Sum the per-layer QuestStats dicts into a flat aggregate."""
     keys = [
-        "block_filled", "evict_d2h", "load_h2d", "select_calls",
+        "block_filled", "evict_d2h", "evict_drop", "load_h2d", "select_calls",
         "selected_total", "selected_on_gpu",
         "h2d_wait_ms", "evict_stall_ms",
         "h2d_wait_events", "evict_stall_events",
@@ -374,6 +378,7 @@ def _engine_worker(cfg_dict: dict, tmp_dir: str, out_path: str) -> None:
             dtype="float16",
             enforce_eager=True,
             max_model_len=cfg.max_model_len,
+            max_num_seqs=1,  # concurrency=1 scope (and write-through sizing)
             gpu_memory_utilization=cfg.gpu_memory_utilization,
             enable_prefix_caching=False,
             enable_chunked_prefill=False,
@@ -394,6 +399,7 @@ def _engine_worker(cfg_dict: dict, tmp_dir: str, out_path: str) -> None:
                 cpu_cache_gib=cfg.cpu_cache_gib,
                 selection_impl=cfg.selection_impl,
                 enable_async_prefetch=False,
+                enable_write_through=cfg.enable_write_through,
                 # Two-pass: debug counters (cuda-Event timing, overlap buffer,
                 # NVTX) ON only for the instrumented pass; OFF on the clean pass
                 # so latency/throughput are unperturbed.
@@ -471,10 +477,15 @@ def _engine_worker(cfg_dict: dict, tmp_dir: str, out_path: str) -> None:
             # Acceptance gate: a "must offload" point that didn't offload is a
             # silent no-op measuring the wrong path. Fail loudly in-worker.
             if cfg.expect_offload:
-                if not (agg["evict_d2h"] > 0 and agg["load_h2d"] > 0):
+                # Write-back spills at eviction (evict_d2h); write-through
+                # mirrors at fill and the eviction just drops the GPU slot
+                # (evict_drop). Either path must show evictions + reloads.
+                evicted = agg["evict_d2h"] + agg["evict_drop"]
+                if not (evicted > 0 and agg["load_h2d"] > 0):
                     raise RuntimeError(
                         f"[{cfg.name}] expected offload but evict_d2h="
-                        f"{agg['evict_d2h']} load_h2d={agg['load_h2d']}. "
+                        f"{agg['evict_d2h']} evict_drop={agg['evict_drop']} "
+                        f"load_h2d={agg['load_h2d']}. "
                         f"gpu_cache_blocks_per_seq="
                         f"{cfg.gpu_cache_blocks_per_seq} too large for prompt "
                         f"({result['prompt_tokens']} tokens, block_size="
@@ -669,7 +680,7 @@ _CSV_COLS = [
     "cuda_used_gib", "weights_gib", "kv_reserved_gib",
     "cosine_vs_dense_mean", "cosine_vs_dense_min",
     "gpu_cache_blocks_per_seq", "top_k",
-    "block_filled", "evict_d2h", "load_h2d",
+    "block_filled", "evict_d2h", "evict_drop", "load_h2d",
     "selected_total", "selected_on_gpu", "gpu_hit_rate",
     "mean_h2d_wait_ms", "mean_evict_stall_ms",
     "offload_mode",
@@ -710,6 +721,7 @@ def _csv_row(r: dict) -> dict:
         "top_k": cfg.get("top_k", 0),
         "block_filled": qs.get("block_filled", 0),
         "evict_d2h": qs.get("evict_d2h", 0),
+        "evict_drop": qs.get("evict_drop", 0),
         "load_h2d": qs.get("load_h2d", 0),
         "selected_total": qs.get("selected_total", 0),
         "selected_on_gpu": qs.get("selected_on_gpu", 0),
@@ -845,6 +857,16 @@ def build_run_plan(args) -> list[RunConfig]:
             expect_offload=True, offload_mode="real", **common,
         )
         base = [dense, quest_no_off, quest_offload]
+        # Stage 2B: optional write-through forced-offload point, same budget as
+        # quest_offload so the only difference is the spill mechanism (drop-evict
+        # + fill-time mirror vs evict-time D2H).
+        if getattr(args, "write_through", False):
+            base.append(RunConfig(
+                name="quest_offload_wt", quest_enabled=True,
+                gpu_cache_blocks_per_seq=args.small_gpu_blocks,
+                expect_offload=True, offload_mode="real",
+                enable_write_through=True, **common,
+            ))
 
     # Expand each base config once per requested pass.
     passes = _passes_for(args.pass_choice)
@@ -934,6 +956,15 @@ def parse_args(argv=None):
                         "must be < blocks the prompt produces AND >= --top-k + 1 "
                         "(one arena slot is reserved for the live decode block, "
                         "so the Quest invariant is top_k <= cap - 1)")
+    p.add_argument("--write-through", action="store_true",
+                   help="Stage 2B: add a write-through forced-offload point "
+                        "(quest_offload_wt) alongside the write-back "
+                        "quest_offload. Write-through mirrors each full block to "
+                        "a durable host slot at fill, so eviction just drops the "
+                        "GPU slot (evict_drop) and a miss is H2D-only. Lets the "
+                        "instrumented pass compare evict_stall_ms write-back vs "
+                        "write-through (mechanism only — end-to-end overlap also "
+                        "needs Stage 3 prefetch ordering).")
     p.add_argument("--profile", action="store_true",
                    help="wrap the INSTRUMENTED-pass worker under `nsys profile` "
                         "(never the clean pass — nsys perturbs timing) so the "
