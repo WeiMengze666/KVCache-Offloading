@@ -187,6 +187,8 @@ class QuestSparseOffloadBackend(AttentionBackend):
         dtype: torch.dtype,
         quest_config,
         kv_caches: dict[str, torch.Tensor] | None = None,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
     ) -> None:
         """Construct the shared BlockSummaryStore + CpuKvBackingStore + per-
         layer TierManager objects, attach a `tier_manager` attribute to each
@@ -232,6 +234,9 @@ class QuestSparseOffloadBackend(AttentionBackend):
         cpu_blocks = quest_config.resolve_cpu_blocks_per_layer(
             page_size_bytes=page_bytes,
             num_quest_layers=num_quest,
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            block_size=block_size,
         )
 
         summary = BlockSummaryStore(
@@ -387,6 +392,16 @@ class QuestSparseOffloadBackend(AttentionBackend):
 
         sample = quest_layers_list[0]
         block_size = vllm_config.cache_config.block_size
+        # Stage 2B Q1: host-pool sizing needs the longest sequence and the
+        # concurrency so write-through can back every logical block.
+        max_model_len = getattr(
+            vllm_config.model_config, "max_model_len", None
+        )
+        max_num_seqs = getattr(
+            getattr(vllm_config, "scheduler_config", None),
+            "max_num_seqs",
+            None,
+        )
 
         cls.init_runtime_state(
             layers=quest_layers_list,
@@ -397,4 +412,6 @@ class QuestSparseOffloadBackend(AttentionBackend):
             dtype=sample.kv_cache_torch_dtype,
             quest_config=quest_config,
             kv_caches=kv_caches,
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
         )

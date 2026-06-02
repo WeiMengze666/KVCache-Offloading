@@ -159,6 +159,68 @@ def test_resolve_cpu_pool_zero_quest_layers_returns_zero():
     ) == 0
 
 
+def test_resolve_cpu_blocks_uses_max_model_len():
+    """Stage 2B Q1: when max_model_len/max_num_seqs/block_size are given, the
+    host pool sizes UP to hold every logical block of every concurrent seq:
+    need = cdiv(max_model_len, block_size) * max_num_seqs, capped by the
+    legacy/gib ceiling. Write-through needs this to back the whole sequence."""
+    from vllm.config.quest import QuestConfig
+
+    # need = cdiv(4096, 256) * 4 = 16 * 4 = 64; legacy ceiling 65536 is looser.
+    cfg = QuestConfig(cpu_cache_blocks=65536)
+    blocks_per_layer = cfg.resolve_cpu_blocks_per_layer(
+        page_size_bytes=1024 * 1024,
+        num_quest_layers=30,
+        max_model_len=4096,
+        max_num_seqs=4,
+        block_size=256,
+    )
+    assert blocks_per_layer == 64
+
+
+def test_resolve_cpu_blocks_capped_below_need_raises_when_write_through():
+    """If the ceiling is below `need` AND write-through is on, the host pool
+    can't back the whole sequence → loud RuntimeError, not silent corruption."""
+    from vllm.config.quest import QuestConfig
+
+    # need = cdiv(4096, 256) * 4 = 64, but legacy ceiling is only 16.
+    cfg = QuestConfig(cpu_cache_blocks=16, enable_write_through=True)
+    with pytest.raises(RuntimeError, match="host pool"):
+        cfg.resolve_cpu_blocks_per_layer(
+            page_size_bytes=1024 * 1024,
+            num_quest_layers=30,
+            max_model_len=4096,
+            max_num_seqs=4,
+            block_size=256,
+        )
+
+
+def test_resolve_cpu_blocks_capped_below_need_ok_without_write_through():
+    """Same under-provisioned ceiling is tolerated (clamped) when write-through
+    is off — write-back reloads lazily and frees, so the pool need not hold all."""
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(cpu_cache_blocks=16, enable_write_through=False)
+    blocks_per_layer = cfg.resolve_cpu_blocks_per_layer(
+        page_size_bytes=1024 * 1024,
+        num_quest_layers=30,
+        max_model_len=4096,
+        max_num_seqs=4,
+        block_size=256,
+    )
+    assert blocks_per_layer == 16  # clamped to the ceiling, no raise
+
+
+def test_resolve_cpu_blocks_legacy_path_unchanged_when_args_absent():
+    """All-None new args ⇒ exact 2A behavior (existing callers unaffected)."""
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(cpu_cache_blocks=128, cpu_cache_gib=None)
+    assert cfg.resolve_cpu_blocks_per_layer(
+        page_size_bytes=1024 * 1024, num_quest_layers=30,
+    ) == 128
+
+
 def test_prefetch_window_requires_async_enabled():
     """Mode 2 (prefetch_window_blocks > 0) requires Mode 1 (async enabled)."""
     from vllm.config.quest import QuestConfig

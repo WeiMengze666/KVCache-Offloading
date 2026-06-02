@@ -43,6 +43,14 @@ class QuestConfig:
     configuration."""
     eviction_policy: EvictionPolicy = "lru"
 
+    # Stage 2B: write-through D2H. When True, every full block is mirrored to a
+    # durable pinned-host slot at fill time (on the d2h_stream); eviction then
+    # just drops the GPU slot (host copy already exists) and a miss is H2D-only.
+    # Requires the host pool to hold every logical block of the sequence — see
+    # resolve_cpu_blocks_per_layer's max_model_len sizing. Opt-in; False keeps
+    # the 2A write-back path byte-for-byte.
+    enable_write_through: bool = False
+
     # Async (Phase C activates these).
     enable_async_prefetch: bool = False
     """Phase C gate. When True, ensure_resident issues non_blocking=True H2D
@@ -158,14 +166,52 @@ class QuestConfig:
 
     def resolve_cpu_blocks_per_layer(
         self, *, page_size_bytes: int, num_quest_layers: int,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
+        block_size: int | None = None,
     ) -> int:
+        """Per-layer pinned-host block count.
+
+        The ceiling is the tighter of the legacy `cpu_cache_blocks` and the
+        optional `cpu_cache_gib` byte budget (2A behavior, preserved exactly
+        when the sizing args below are absent).
+
+        Stage 2B: when `max_model_len`, `max_num_seqs`, and `block_size` are all
+        given, the pool must be able to back every logical block of every
+        concurrent sequence under write-through, so it sizes UP to
+        ``need = cdiv(max_model_len, block_size) * max_num_seqs`` — but never
+        above the ceiling. If the ceiling is below `need` AND write-through is
+        enabled, that's unsatisfiable (an evicted block would have no host
+        backup → silent corruption), so raise loudly. With write-through off,
+        the under-provisioned ceiling is tolerated (write-back reloads-and-frees
+        lazily, so it need not hold the whole sequence).
+        """
         if num_quest_layers <= 0:
             return 0
         legacy_cap = self.cpu_cache_blocks
         if self.cpu_cache_gib is None:
-            return legacy_cap
-        gib_cap = (
-            self.cpu_cache_gib * (1024 ** 3) // page_size_bytes
-            // num_quest_layers
-        )
-        return min(legacy_cap, gib_cap)
+            ceiling = legacy_cap
+        else:
+            gib_cap = (
+                self.cpu_cache_gib * (1024 ** 3) // page_size_bytes
+                // num_quest_layers
+            )
+            ceiling = min(legacy_cap, gib_cap)
+
+        if max_model_len is None or max_num_seqs is None or block_size is None:
+            return ceiling
+
+        need = -(-max_model_len // block_size) * max_num_seqs  # cdiv * seqs
+        if need > ceiling:
+            if self.enable_write_through:
+                raise RuntimeError(
+                    f"Quest write-through needs the host pool to back the "
+                    f"whole sequence: need {need} blocks/layer "
+                    f"(cdiv({max_model_len},{block_size}) * {max_num_seqs}) "
+                    f"but the configured ceiling is only {ceiling} "
+                    f"(cpu_cache_blocks={self.cpu_cache_blocks}, "
+                    f"cpu_cache_gib={self.cpu_cache_gib}). Raise the ceiling "
+                    f"or lower max_model_len/max_num_seqs."
+                )
+            return ceiling
+        return need
