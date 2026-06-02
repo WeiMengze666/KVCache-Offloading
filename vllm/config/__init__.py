@@ -60,6 +60,23 @@ from vllm.config.vllm import (
 )
 from vllm.config.weight_transfer import WeightTransferConfig
 
+
+def get_active_sparse_cfg(vllm_config):
+    """Return the enabled sparse-offload cfg or None.
+
+    Priority: ArkValeConfig > QuestConfig. They are mutually exclusive at
+    the EngineArgs layer; this helper picks deterministically if the
+    invariant is somehow broken downstream.
+    """
+    arkvale_cfg = getattr(vllm_config, "arkvale_config", None)
+    if arkvale_cfg is not None and arkvale_cfg.enabled:
+        return arkvale_cfg
+    quest_cfg = getattr(vllm_config, "quest_config", None)
+    if quest_cfg is not None and quest_cfg.enabled:
+        return quest_cfg
+    return None
+
+
 # __all__ should only contain classes and functions.
 # Types and globals should be imported from their respective modules.
 __all__ = [
@@ -132,6 +149,8 @@ __all__ = [
     "is_init_field",
     "replace",
     "update_config",
+    # helpers defined in vllm/config/__init__.py
+    "get_active_sparse_cfg",
     # From vllm.config.vllm
     "VllmConfig",
     "get_cached_compilation_config",
