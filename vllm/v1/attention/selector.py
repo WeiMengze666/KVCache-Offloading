@@ -70,17 +70,18 @@ def get_attn_backend(
             f"Valid values are: {valid_cache_dtypes}"
         )
 
-    from vllm.config import get_current_vllm_config
+    from vllm.config import get_active_sparse_cfg, get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
 
-    quest_config = getattr(vllm_config, "quest_config", None)
-    if quest_config is not None and quest_config.enabled:
+    sparse_cfg = get_active_sparse_cfg(vllm_config)
+    if sparse_cfg is not None:
         from vllm.v1.attention.backends.quest.registration import register
 
         register()
-        # Quest backend is sparse; selector validates use_sparse == is_sparse.
-        # Per-layer dense delegation (full_kv_layers + prefill) happens inside
+        # Quest / ArkVale share QuestSparseOffloadBackend (sparse). Selector
+        # validates use_sparse == is_sparse. Per-layer dense delegation
+        # (full_kv_layers + prefill) happens inside
         # QuestSparseOffloadImpl.forward — every Attention layer routes
         # through the Quest backend at construction time.
         use_sparse = True
