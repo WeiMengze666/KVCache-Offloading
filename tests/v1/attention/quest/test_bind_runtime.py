@@ -463,9 +463,11 @@ def test_bind_runtime_stashes_selection_callable_triton():
 def test_real_engine_layer_gets_bounded_arena():
     """init_runtime_state must give each Quest layer a private arena of
     gpu_cache_blocks_per_seq blocks, NOT a view of the full engine cache."""
-    import torch
-    import pytest
     from types import SimpleNamespace
+
+    import pytest
+    import torch
+
     from vllm.config.quest import QuestConfig
     from vllm.v1.attention.backends.quest.backend import QuestSparseOffloadBackend
 
@@ -474,17 +476,31 @@ def test_real_engine_layer_gets_bounded_arena():
     cap = 8
     block_size, h_kv, hd = 256, 2, 64
     full_blocks = 64  # engine cache is much bigger than the arena
-    qcfg = QuestConfig(enabled=True, top_k=8, gpu_cache_blocks_per_seq=cap,
-                       full_kv_layers=[0, 1], block_size=block_size)
-    layer = SimpleNamespace(
-        layer_idx=2, layer_name="model.layers.2.self_attn.attn",
-        num_kv_heads=h_kv, head_size=hd, kv_cache_torch_dtype=torch.float16,
+    qcfg = QuestConfig(
+        enabled=True,
+        top_k=8,
+        gpu_cache_blocks_per_seq=cap,
+        full_kv_layers=[0, 1],
+        block_size=block_size,
     )
-    engine_kv = torch.zeros(full_blocks, 2, block_size, h_kv, hd,
-                            dtype=torch.float16, device="cuda")
+    layer = SimpleNamespace(
+        layer_idx=2,
+        layer_name="model.layers.2.self_attn.attn",
+        num_kv_heads=h_kv,
+        head_size=hd,
+        kv_cache_torch_dtype=torch.float16,
+    )
+    engine_kv = torch.zeros(
+        full_blocks, 2, block_size, h_kv, hd, dtype=torch.float16, device="cuda"
+    )
     QuestSparseOffloadBackend.init_runtime_state(
-        layers=[layer], block_size=block_size, num_kv_heads=h_kv, head_size=hd,
-        max_blocks_total=full_blocks, dtype=torch.float16, quest_config=qcfg,
+        layers=[layer],
+        block_size=block_size,
+        num_kv_heads=h_kv,
+        head_size=hd,
+        max_blocks_total=full_blocks,
+        dtype=torch.float16,
+        quest_config=qcfg,
         kv_caches={"model.layers.2.self_attn.attn": engine_kv},
     )
     tm = layer.tier_manager
@@ -493,3 +509,74 @@ def test_real_engine_layer_gets_bounded_arena():
     assert tm.gpu_k.data_ptr() != engine_kv[:, 0].data_ptr()  # not aliased
     assert tm.gpu_pool_aliases_kv_cache is False
     assert tm.engine_kv_cache is engine_kv  # kept as trim source
+
+
+def test_init_runtime_state_propagates_digest_mode_quest_default():
+    """digest_mode defaults to 'quest_minmax' and reaches BlockSummaryStore."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    from vllm.config.quest import QuestConfig
+    from vllm.v1.attention.backends.quest.backend import QuestSparseOffloadBackend
+
+    quest_cfg = QuestConfig(
+        enabled=True,
+        block_size=256,
+        top_k=4,
+        gpu_cache_blocks_per_seq=8,
+        full_kv_layers=[],
+    )
+    layer = SimpleNamespace(
+        layer_idx=2,
+        num_kv_heads=2,
+        head_size=64,
+        layer_name="quest.0",
+    )
+    QuestSparseOffloadBackend.init_runtime_state(
+        layers=[layer],
+        block_size=256,
+        num_kv_heads=2,
+        head_size=64,
+        max_blocks_total=16,
+        dtype=torch.float16,
+        quest_config=quest_cfg,
+        kv_caches=None,
+    )
+    summary_store = layer.tier_manager.summary_store
+    assert summary_store.digest_mode == "quest_minmax"
+
+
+def test_init_runtime_state_propagates_digest_mode_arkvale():
+    """digest_mode='arkvale_cuboid_mean' flows from QuestConfig to BlockSummaryStore."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    from vllm.config.quest import QuestConfig
+    from vllm.v1.attention.backends.quest.backend import QuestSparseOffloadBackend
+
+    quest_cfg = QuestConfig(
+        enabled=True,
+        block_size=256,
+        top_k=4,
+        gpu_cache_blocks_per_seq=8,
+        full_kv_layers=[],
+        digest_mode="arkvale_cuboid_mean",
+    )
+    layer = SimpleNamespace(
+        layer_idx=2,
+        num_kv_heads=2,
+        head_size=64,
+        layer_name="quest.0",
+    )
+    QuestSparseOffloadBackend.init_runtime_state(
+        layers=[layer],
+        block_size=256,
+        num_kv_heads=2,
+        head_size=64,
+        max_blocks_total=16,
+        dtype=torch.float16,
+        quest_config=quest_cfg,
+        kv_caches=None,
+    )
+    summary_store = layer.tier_manager.summary_store
+    assert summary_store.digest_mode == "arkvale_cuboid_mean"

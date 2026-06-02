@@ -242,6 +242,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
             head_size=head_size,
             dtype=dtype,
             device="cuda",
+            digest_mode=quest_config.digest_mode,
         )
         cpu_store = CpuKvBackingStore(
             num_layers=num_quest,
@@ -279,8 +280,12 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 # FA layout: full.shape = (num_blocks, 2, block_size, num_kv_heads, head_size)
                 cap = quest_config.gpu_cache_blocks_per_seq
                 gpu_k = torch.empty(
-                    cap, full.shape[2], full.shape[3], full.shape[4],
-                    dtype=full.dtype, device=full.device,
+                    cap,
+                    full.shape[2],
+                    full.shape[3],
+                    full.shape[4],
+                    dtype=full.dtype,
+                    device=full.device,
                 )
                 gpu_v = torch.empty_like(gpu_k)
                 gpu_budget = cap
