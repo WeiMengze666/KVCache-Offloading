@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.config.arkvale import ArkValeConfig
 from vllm.config.attention import AttentionConfig
 from vllm.config.cache import CacheConfig
 from vllm.config.compilation import (
@@ -121,6 +122,8 @@ __all__ = [
     "ProfilerConfig",
     # From vllm.config.quest
     "QuestConfig",
+    # From vllm.config.arkvale
+    "ArkValeConfig",
     # From vllm.config.utils
     "ConfigType",
     "SupportsMetricsInfo",
