@@ -2397,6 +2397,28 @@ class GPUModelRunner(
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
+        # Quest: stash the current batch's stable request ids on each
+        # QuestMetadataBuilder so the per-forward attn_metadata carries them.
+        # impl_helpers uses these as the seq_id key for the TierManager LRU
+        # arena; without this, two consecutive single-request generates both
+        # see seq_id=0 and the second reads the first's arena content.
+        quest_config_local = getattr(self.vllm_config, "quest_config", None)
+        if (
+            quest_config_local is not None
+            and quest_config_local.enabled
+            and not for_cudagraph_capture
+        ):
+            from vllm.v1.attention.backends.quest.metadata import (
+                QuestMetadataBuilder,
+            )
+
+            req_ids_snapshot = tuple(self.input_batch.req_ids[:num_reqs])
+            for kv_groups in self.attn_groups:
+                for group in kv_groups:
+                    for builder in group.metadata_builders:
+                        if isinstance(builder, QuestMetadataBuilder):
+                            builder.set_request_ids(req_ids_snapshot)
+
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy

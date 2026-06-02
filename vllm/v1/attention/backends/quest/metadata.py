@@ -9,6 +9,7 @@ Phase B: QuestAttentionMetadata is now a real subclass that adds
   -1 for full-KV layers
 - is_full_kv_layer: bool tensor over global layer_idx
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -46,6 +47,18 @@ class QuestAttentionMetadata(FlashAttentionMetadata):
     The default is only a fallback for unit-test metadata built without a
     configured builder."""
 
+    request_ids: tuple[str, ...] = field(default_factory=tuple)
+    """Stable per-request ids in current-batch order, length == num_reqs.
+
+    TierManager keys all per-seq state (LRU slot map, _trimmed set, _cpu_slots,
+    residency rows) by these ids. Using ``req_idx`` (the position in the batch)
+    instead silently aliases state across requests as soon as the engine
+    serves a second request — the second request's prefill reads the first
+    request's arena content. Populated by QuestMetadataBuilder.set_request_ids
+    once per forward from ``input_batch.req_ids``. Unit-test fixtures that
+    skip the builder fall back to () and impl_helpers maps that to ``req_idx``
+    for backwards compatibility."""
+
 
 class QuestMetadataBuilder(FlashAttentionMetadataBuilder):
     """Delegates standard FA metadata then promotes to QuestAttentionMetadata.
@@ -59,12 +72,20 @@ class QuestMetadataBuilder(FlashAttentionMetadataBuilder):
         self._fa_builder = self  # Phase B: build via super().build
         self._quest_layer_indices: torch.Tensor | None = None
         self._quest_top_k: int = 64
+        self._request_ids: tuple[str, ...] = ()
 
     def set_quest_layer_indices(self, indices: torch.Tensor) -> None:
         self._quest_layer_indices = indices.to(torch.int32)
 
     def set_quest_top_k(self, top_k: int) -> None:
         self._quest_top_k = int(top_k)
+
+    def set_request_ids(self, request_ids) -> None:
+        """Stash the current batch's stable per-request ids for the next
+        ``build()`` call. Called once per forward by GPUModelRunner from
+        ``input_batch.req_ids``. The builder snapshots a tuple so the value
+        is immutable across the build path."""
+        self._request_ids = tuple(request_ids)
 
     def build(self, *args, **kwargs) -> QuestAttentionMetadata:
         fa_md = super().build(*args, **kwargs)
@@ -76,20 +97,18 @@ class QuestMetadataBuilder(FlashAttentionMetadataBuilder):
         fa_md = self._fa_builder.build()
         return self._promote(fa_md)
 
-    def _promote(
-        self, fa_md: FlashAttentionMetadata
-    ) -> QuestAttentionMetadata:
+    def _promote(self, fa_md: FlashAttentionMetadata) -> QuestAttentionMetadata:
         idx = self._quest_layer_indices
         if idx is None:
             idx = torch.empty(0, dtype=torch.int32)
-        is_full = (idx < 0)
+        is_full = idx < 0
         # Use only fields actually present on FlashAttentionMetadata to avoid
         # version skew breaking us.
         return QuestAttentionMetadata(
-            **{f: getattr(fa_md, f)
-               for f in fa_md.__dataclass_fields__},
+            **{f: getattr(fa_md, f) for f in fa_md.__dataclass_fields__},
             sparse_block_table=None,
             quest_layer_indices=idx,
             is_full_kv_layer=is_full,
             quest_top_k=getattr(self, "_quest_top_k", 64),
+            request_ids=getattr(self, "_request_ids", ()),
         )

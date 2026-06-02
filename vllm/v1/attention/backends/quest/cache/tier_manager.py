@@ -12,6 +12,7 @@ Owns:
 Phase B is fully synchronous; ensure_resident returns None so callers do
 not need to await anything. Phase C will return an Event | None.
 """
+
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -52,7 +53,7 @@ class _LRUSlotMap:
 
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
-        self._key_to_slot: "OrderedDict[tuple[int, int], int]" = OrderedDict()
+        self._key_to_slot: OrderedDict[tuple[int, int], int] = OrderedDict()
         self._free_slots = list(reversed(range(capacity)))
 
     def __contains__(self, key) -> bool:
@@ -128,6 +129,13 @@ class TierManager:
         # _stats. Zero-cost when False (no Event creation, no sync). Gated by
         # QuestConfig.enable_debug_counters at construction time.
         self.enable_event_timing = enable_event_timing
+        # Snapshot of seq_ids that owned slots/spilled blocks at the end of the
+        # previous decode step. notify_filled_blocks_after_decode diffs this
+        # against the current active set so requests that left the batch
+        # release their (seq_id, *) entries via free_request. Populated on
+        # demand; mypy needs the declaration to allow attribute access in
+        # impl_helpers.
+        self._active_seqs: set[int] | None = None
         # Benchmark/debug-only (Stage 1 cross-layer overlap): when True,
         # run_sparse_decode records each step's selected block-id set into
         # _selected_log via record_selected. Drained out-of-band by the
@@ -162,10 +170,13 @@ class TierManager:
         """
         if not self.enable_overlap_capture:
             return
-        self._selected_log.append({
-            "step": int(step), "seq_id": int(seq_id),
-            "block_ids": [int(b) for b in block_ids],
-        })
+        self._selected_log.append(
+            {
+                "step": int(step),
+                "seq_id": int(seq_id),
+                "block_ids": [int(b) for b in block_ids],
+            }
+        )
 
     def drain_selected(self) -> list[dict]:
         out = self._selected_log
@@ -192,13 +203,14 @@ class TierManager:
         Cheap set membership over the LRU map; no GPU sync, no LRU mutation.
         """
         return sum(
-            1
-            for bid in logical_block_ids
-            if (seq_id, int(bid)) in self._slot_map
+            1 for bid in logical_block_ids if (seq_id, int(bid)) in self._slot_map
         )
 
     def register_prefill_summary(
-        self, seq_id: int, logical_block_id: int, k_block: torch.Tensor,
+        self,
+        seq_id: int,
+        logical_block_id: int,
+        k_block: torch.Tensor,
     ) -> None:
         """Prefill-time registration: record the per-block K summary ONLY.
 
@@ -213,7 +225,9 @@ class TierManager:
         residency is established exclusively by trim_to_working_set.
         """
         self.summary_store.on_block_filled(
-            self.layer_idx, logical_block_id, k_block,
+            self.layer_idx,
+            logical_block_id,
+            k_block,
         )
 
     def on_block_filled(
@@ -228,7 +242,9 @@ class TierManager:
         """
         # Update summary first — this is the only thing that survives eviction.
         self.summary_store.on_block_filled(
-            self.layer_idx, logical_block_id, k_block,
+            self.layer_idx,
+            logical_block_id,
+            k_block,
         )
 
         key = (seq_id, logical_block_id)
@@ -248,7 +264,10 @@ class TierManager:
         return slot
 
     def trim_to_working_set(
-        self, seq_id: int, num_full_blocks: int, kv_cache: torch.Tensor,
+        self,
+        seq_id: int,
+        num_full_blocks: int,
+        kv_cache: torch.Tensor,
         block_table_row,
     ) -> None:
         """One-shot prefill->decode trim. Keep the last cap-1 full blocks in
@@ -287,7 +306,10 @@ class TierManager:
                         f"sizing)"
                     ) from e
                 self.cpu_store.store_block(
-                    self.layer_idx, cpu_slot, k_eng[phys], v_eng[phys],
+                    self.layer_idx,
+                    cpu_slot,
+                    k_eng[phys],
+                    v_eng[phys],
                 )
                 self._cpu_slots[(seq_id, b)] = cpu_slot
                 self.residency.begin_evict(self.layer_idx, b)
@@ -295,8 +317,11 @@ class TierManager:
                 self._stats.evict_d2h += 1
 
     def write_live_block(
-        self, seq_id: int, live_block_id: int,
-        k_block: torch.Tensor, v_block: torch.Tensor,
+        self,
+        seq_id,
+        live_block_id: int,
+        k_block: torch.Tensor,
+        v_block: torch.Tensor,
     ) -> int:
         """Copy the live partial block into a (re-touched) arena slot. The live
         block holds the just-generated decode token; it is never scored, never
@@ -312,11 +337,65 @@ class TierManager:
         self.residency.mark_on_gpu(self.layer_idx, live_block_id)
         return slot
 
+    def free_request(self, seq_id) -> None:
+        """Release every TierManager state row keyed by ``seq_id``.
+
+        Called when a vLLM request finishes (or its slot is reused for a new
+        request). Without this, every Quest layer's ``_slot_map``,
+        ``_cpu_slots``, and ``_trimmed`` grow unbounded across requests, and
+        a fresh ``seq_id`` cannot reach a clean baseline because residency
+        rows still carry stale states from prior seqs.
+
+        Idempotent: a seq_id that was never seen on this layer is a no-op.
+
+        - LRU slot map: every ``(seq_id, *)`` entry is freed back to the slot
+          pool. We do NOT D2H-spill these — the request is done, the contents
+          are dead.
+        - CPU pool: every CPU slot recorded for ``(seq_id, *)`` is returned
+          to the per-layer free list (otherwise the pool ceiling is hit
+          quickly on long workloads).
+        - ``_trimmed``: discard, so a future request reusing this seq_id
+          (cannot happen with vLLM's req_ids in practice, but guard anyway)
+          re-runs trim_to_working_set.
+        - residency: reset every block this layer ever marked for this seq
+          back to ON_GPU (the zero state) so the next seq's first transition
+          starts from a clean baseline.
+
+        Note: residency is keyed only by ``(layer_idx, logical_block_id)`` —
+        not per-seq — so two concurrent seqs sharing a logical_block_id
+        index would alias. For Stage 2A's serial / small-batch workloads
+        this aliasing is harmless because at most one seq's blocks are
+        active at any given physical block_id slot. Multi-seq concurrency
+        on overlapping logical_block_ids is a Stage 3 concern (see
+        stage2a-delivery-status.md §4); free_request only cleans up after a
+        seq is gone, so the aliasing window doesn't matter here.
+        """
+        # 1. LRU + GPU slot pool. iterating a dict while mutating: copy keys.
+        keys = [k for k in self._slot_map._key_to_slot if k[0] == seq_id]
+        evicted_blocks: list[int] = []
+        for k in keys:
+            self._slot_map.free(k)
+            evicted_blocks.append(k[1])
+        # 2. CPU slots. Each (seq_id, *) -> cpu_slot must be returned to
+        # cpu_store free list, otherwise CPU pool exhausts after enough
+        # requests and trim raises RuntimeError.
+        cpu_keys = [k for k in self._cpu_slots if k[0] == seq_id]
+        for k in cpu_keys:
+            cpu_slot = self._cpu_slots.pop(k)
+            self.cpu_store.free(self.layer_idx, cpu_slot)
+            evicted_blocks.append(k[1])
+        # 3. trimmed marker.
+        self._trimmed.discard(seq_id)
+        # 4. Residency rows. Use mark_on_gpu (the legal write to this layer's
+        # state machine) rather than poking _states directly. Idempotent.
+        for b in evicted_blocks:
+            self.residency.mark_on_gpu(self.layer_idx, b)
+
     def ensure_resident(
         self,
         seq_id: int,
         logical_block_ids: torch.Tensor,
-        keep_resident_ids: "list[int] | None" = None,
+        keep_resident_ids: list[int] | None = None,
     ) -> torch.cuda.Event | None:
         """Make every selected block GPU-resident, returning an H2D Event to
         wait on (async) or None (sync/aliasing).
@@ -360,7 +439,10 @@ class TierManager:
         return self.stream_pool.record_h2d_done()
 
     def _touch_resident(
-        self, seq_id: int, ids: "list[int]", keep_ids: "list[int]",
+        self,
+        seq_id: int,
+        ids: list[int],
+        keep_ids: list[int],
     ) -> None:
         """Pass 1 of ensure_resident: bump every already-resident block in
         (ids ∪ keep_ids) to MRU so the Pass-2 reload loop never evicts a block
@@ -397,16 +479,16 @@ class TierManager:
             return
         cpu_slot = self._cpu_slots.pop(key, None)
         if cpu_slot is None:
-            raise RuntimeError(
-                f"block {key} is neither on GPU nor in CPU pool"
-            )
+            raise RuntimeError(f"block {key} is neither on GPU nor in CPU pool")
         slot, evicted = self._slot_map.add(key)
         if evicted is not None:
             self.spill_hook(*evicted, slot=slot)
         self.residency.begin_load(self.layer_idx, bid)
         self.cpu_store.load_block(
-            self.layer_idx, cpu_slot,
-            self.gpu_k[slot], self.gpu_v[slot],
+            self.layer_idx,
+            cpu_slot,
+            self.gpu_k[slot],
+            self.gpu_v[slot],
         )
         self.cpu_store.free(self.layer_idx, cpu_slot)
         self.residency.complete_load(self.layer_idx, bid)
@@ -421,9 +503,7 @@ class TierManager:
             return
         cpu_slot = self._cpu_slots.pop(key, None)
         if cpu_slot is None:
-            raise RuntimeError(
-                f"block {key} is neither on GPU nor in CPU pool"
-            )
+            raise RuntimeError(f"block {key} is neither on GPU nor in CPU pool")
         slot, evicted = self._slot_map.add(key)
         if evicted is not None:
             self.spill_hook(*evicted, slot=slot)
@@ -441,8 +521,10 @@ class TierManager:
         # the caller's wait_event, so the hazard is dormant.
         self.residency.begin_load(self.layer_idx, bid)
         self.cpu_store.load_block(
-            self.layer_idx, cpu_slot,
-            self.gpu_k[slot], self.gpu_v[slot],
+            self.layer_idx,
+            cpu_slot,
+            self.gpu_k[slot],
+            self.gpu_v[slot],
             non_blocking=True,
         )
         self.cpu_store.free(self.layer_idx, cpu_slot)
@@ -450,7 +532,11 @@ class TierManager:
         self._stats.load_h2d += 1
 
     def _spill_to_cpu(
-        self, seq_id: int, logical_block_id: int, *, slot: int,
+        self,
+        seq_id: int,
+        logical_block_id: int,
+        *,
+        slot: int,
     ) -> None:
         """Snapshot gpu_k[slot]/gpu_v[slot] into the CPU pool BEFORE the
         slot is overwritten by the new key.
@@ -468,8 +554,10 @@ class TierManager:
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
                 self.cpu_store.store_block(
-                    self.layer_idx, cpu_slot,
-                    self.gpu_k[slot], self.gpu_v[slot],
+                    self.layer_idx,
+                    cpu_slot,
+                    self.gpu_k[slot],
+                    self.gpu_v[slot],
                 )
                 end.record()
                 end.synchronize()
@@ -477,8 +565,10 @@ class TierManager:
                 self._stats.evict_stall_events += 1
             else:
                 self.cpu_store.store_block(
-                    self.layer_idx, cpu_slot,
-                    self.gpu_k[slot], self.gpu_v[slot],
+                    self.layer_idx,
+                    cpu_slot,
+                    self.gpu_k[slot],
+                    self.gpu_v[slot],
                 )
         else:
             d2h = self.stream_pool.d2h_stream
@@ -488,8 +578,10 @@ class TierManager:
             self.gpu_v[slot].record_stream(d2h)
             with torch.cuda.stream(d2h):
                 self.cpu_store.store_block(
-                    self.layer_idx, cpu_slot,
-                    self.gpu_k[slot], self.gpu_v[slot],
+                    self.layer_idx,
+                    cpu_slot,
+                    self.gpu_k[slot],
+                    self.gpu_v[slot],
                     non_blocking=True,
                 )
         self.residency.complete_evict(self.layer_idx, logical_block_id)

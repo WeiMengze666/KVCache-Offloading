@@ -24,11 +24,28 @@ def _nvtx_range(name: str, enabled: bool):
         yield
         return
     import torch
+
     torch.cuda.nvtx.range_push(name)
     try:
         yield
     finally:
         torch.cuda.nvtx.range_pop()
+
+
+def _seq_id_for(md, req_idx: int):
+    """Stable per-request key for TierManager state (LRU, _trimmed, _cpu_slots).
+
+    Uses ``md.request_ids[req_idx]`` (vLLM's input_batch.req_ids, populated by
+    QuestMetadataBuilder.set_request_ids per forward) when available. Falls
+    back to ``req_idx`` ONLY for unit-test metadata fixtures that bypass the
+    builder — production paths must always carry request_ids. Without this,
+    the TierManager arena keys on batch-position and a second generate() call
+    aliases the first call's KV state.
+    """
+    rids = getattr(md, "request_ids", ())
+    if rids and req_idx < len(rids):
+        return rids[req_idx]
+    return req_idx
 
 
 def notify_filled_blocks_after_prefill(layer, key, value, md) -> None:
@@ -60,12 +77,13 @@ def notify_filled_blocks_after_prefill(layer, key, value, md) -> None:
         if end - beg < block_size:
             continue
         full_blocks = (end - beg) // block_size
+        seq_id = _seq_id_for(md, req_idx)
         for b in range(full_blocks):
             tok_lo = beg + b * block_size
             tok_hi = tok_lo + block_size
             block_id = b
             tm.register_prefill_summary(
-                seq_id=req_idx,
+                seq_id=seq_id,
                 logical_block_id=block_id,
                 k_block=key[tok_lo:tok_hi],
             )
@@ -90,36 +108,58 @@ def notify_filled_blocks_after_decode(layer, kv_cache, md) -> None:
 
     The KV was already written into `kv_cache` by reshape_and_cache_flash, so
     full/partial blocks are read back from their engine physical slots.
+
+    Per-forward GC: any seq the manager has state for that is NOT in the
+    current batch's request_ids has finished (or been preempted); release its
+    LRU/CPU/residency rows via TierManager.free_request. Without this, every
+    request leaks its block_filled CPU slots and arena LRU keys, and the CPU
+    pool exhausts (RuntimeError) after enough sequential requests.
     """
     tm: TierManager | None = getattr(layer, "tier_manager", None)
     if tm is None:
         return
     block_size = tm.gpu_k.shape[1]
     seq_lens = md.seq_lens.tolist()
+    rids = getattr(md, "request_ids", ()) or ()
+    active = {rids[i] if i < len(rids) else i for i in range(len(seq_lens))}
+    # Compare against the manager's last-seen active set. Anything that
+    # disappeared has finished — free it.
+    prev_active = getattr(tm, "_active_seqs", None)
+    if prev_active is not None:
+        for old in prev_active - active:
+            tm.free_request(old)
+    tm._active_seqs = active
     # kv_cache layout: (num_blocks, 2, block_size, num_kv_heads, head_size).
     k_cache_view = kv_cache[:, 0]
     v_cache_view = kv_cache[:, 1]
     for req_idx, sl in enumerate(seq_lens):
         full_blocks = sl // block_size
+        seq_id = _seq_id_for(md, req_idx)
         # (a) one-shot trim on first decode for this seq.
         tm.trim_to_working_set(
-            seq_id=req_idx, num_full_blocks=full_blocks,
-            kv_cache=kv_cache, block_table_row=md.block_table[req_idx],
+            seq_id=seq_id,
+            num_full_blocks=full_blocks,
+            kv_cache=kv_cache,
+            block_table_row=md.block_table[req_idx],
         )
         # (b) a block just completed iff sl % block_size == 0.
         if sl != 0 and sl % block_size == 0:
             block_id = sl // block_size - 1
             phys = int(md.block_table[req_idx, block_id].item())
             tm.on_block_filled(
-                seq_id=req_idx, logical_block_id=block_id,
-                k_block=k_cache_view[phys], v_block=v_cache_view[phys],
+                seq_id=seq_id,
+                logical_block_id=block_id,
+                k_block=k_cache_view[phys],
+                v_block=v_cache_view[phys],
             )
         # (c) refresh the live partial block into the arena (if any).
         if sl % block_size != 0:
             phys = int(md.block_table[req_idx, full_blocks].item())
             tm.write_live_block(
-                seq_id=req_idx, live_block_id=full_blocks,
-                k_block=k_cache_view[phys], v_block=v_cache_view[phys],
+                seq_id=seq_id,
+                live_block_id=full_blocks,
+                k_block=k_cache_view[phys],
+                v_block=v_cache_view[phys],
             )
 
 
@@ -190,7 +230,7 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     if pool is not None:
         for req_idx in range(num_reqs):
             prefetch_event = pool.pop_prefetch_event(
-                seq_id=req_idx,
+                seq_id=_seq_id_for(md, req_idx),
                 target_layer_idx=layer.layer_idx,
             )
             if prefetch_event is not None:
@@ -199,6 +239,7 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     per_req_top_ids: list[torch.Tensor] = []
     out_chunks = []
     for req_idx in range(num_reqs):
+        seq_id = _seq_id_for(md, req_idx)
         sl = int(seq_lens[req_idx].item())
         # Quest scores only *fully filled* blocks: the trailing partial block
         # has no tier_manager entry (on_block_filled registers a block only on
@@ -237,7 +278,7 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
             # step = this layer's select_calls-1 (0-based); seq_id = req_idx.
             tm.record_selected(
                 step=tm_stats._stats.select_calls - 1,
-                seq_id=req_idx,
+                seq_id=seq_id,
                 block_ids=top_ids.tolist(),
             )
         if tm_stats is not None:
@@ -248,7 +289,7 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
             # (after which the metric would always read 100%). Cheap set
             # membership over the LRU map; no GPU sync, no LRU mutation.
             tm_stats._stats.selected_on_gpu += tm.count_resident(
-                seq_id=req_idx,
+                seq_id=seq_id,
                 logical_block_ids=top_ids.tolist(),
             )
         # Wait on H2D completion before kernel reads the slots. Sync mode
@@ -263,7 +304,7 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         keep_ids = [full_blocks] if has_partial else None
         with _nvtx_range(f"quest.ensure_resident.L{tm.layer_idx}", nvtx_gate):
             h2d_event = tm.ensure_resident(
-                seq_id=req_idx,
+                seq_id=seq_id,
                 logical_block_ids=top_ids,
                 keep_resident_ids=keep_ids,
             )
@@ -277,9 +318,9 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         # slots were bogus; Tasks 1-4 made the arena a real, curated, bounded
         # buffer, so we read it directly — the offload round-trip is real.)
         slot_list = [
-            tm.logical_to_slot(seq_id=req_idx, logical_block_id=int(b))
+            tm.logical_to_slot(seq_id=seq_id, logical_block_id=int(b))
             for b in top_ids.tolist()
-        ]        # Number of FULL blocks actually gathered (top_k may be < full_blocks).
+        ]  # Number of FULL blocks actually gathered (top_k may be < full_blocks).
         num_full_gathered = len(slot_list)
         # Trailing PARTIAL block lifecycle (Stages A/B/C — see Task 5b):
         #  A (management): the partial block holds the live decode token at
@@ -300,7 +341,7 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
         #    appended, residual = 0 — full-blocks-only gather.
         if has_partial:
             slot_list.append(
-                tm.logical_to_slot(seq_id=req_idx, logical_block_id=full_blocks)
+                tm.logical_to_slot(seq_id=seq_id, logical_block_id=full_blocks)
             )
         slots = torch.tensor(
             slot_list,
@@ -353,7 +394,7 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
                         # LRU-thrash exposure (see QuestConfig docstring).
                         ids = top_ids[:window]
                         next_tm.prefetch_top_ids(
-                            seq_id=req_idx,
+                            seq_id=_seq_id_for(md, req_idx),
                             logical_block_ids=ids,
                         )
 
