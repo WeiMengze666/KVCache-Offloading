@@ -366,7 +366,9 @@ class QuestSparseOffloadBackend(AttentionBackend):
         5. Call init_runtime_state with the kv_caches dict so each
            TierManager points into the vLLM-allocated tensor.
         """
-        quest_config = getattr(vllm_config, "quest_config", None)
+        from vllm.config import get_active_sparse_cfg
+
+        quest_config = get_active_sparse_cfg(vllm_config)
         if quest_config is None or not quest_config.enabled:
             return
 
