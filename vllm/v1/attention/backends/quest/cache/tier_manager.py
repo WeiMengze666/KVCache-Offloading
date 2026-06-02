@@ -178,17 +178,21 @@ class TierManager:
     def stats(self) -> QuestStats:
         return self._stats
 
-    def record_selected(self, step: int, seq_id: int, block_ids) -> None:
+    def record_selected(self, step: int, seq_id, block_ids) -> None:
         """Debug-only (Stage 1 cross-layer overlap). Append this step's selected
         block ids for this (layer-slot, step, seq). No-op unless capture is on.
         Cheap: a list of small int lists; drained via apply_model after the run.
+
+        seq_id is the engine's stable request id (a string like '0-96e46bd1'
+        since the cross-request KV-leak fix) — kept as-is (opaque hashable used
+        only as a grouping key downstream), NOT coerced to int.
         """
         if not self.enable_overlap_capture:
             return
         self._selected_log.append(
             {
                 "step": int(step),
-                "seq_id": int(seq_id),
+                "seq_id": seq_id,
                 "block_ids": [int(b) for b in block_ids],
             }
         )
