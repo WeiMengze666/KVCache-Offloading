@@ -39,20 +39,22 @@ is set. The test sets it via monkeypatch so the worker accepts the probe.
 The flag is scoped to the test process (and propagated to children via env
 inheritance at fork) and reset on teardown.
 
-Current status: xfail (R-E1-4)
-------------------------------
-At the time of writing, ``enable_quest_sparse_offload=True`` does *not*
-flip ``AttentionConfig.backend`` to ``AttentionBackendEnum.CUSTOM``. The v1
-selector therefore picks ``FlashAttentionBackend`` for every layer, and
-``QuestSparseOffloadBackend.bind_runtime`` filters those layers out (they
-fail ``layer.attn_backend is cls``). No layer ever receives a TierManager
-and the assertions below trip. This is R-E1-4 in the design doc.
+Current status: PASSING (R-E1-4 resolved)
+-----------------------------------------
+This test was once ``xfail(strict=False)`` for R-E1-4: at that time
+``enable_quest_sparse_offload=True`` did *not* flip ``AttentionConfig.backend``
+to ``AttentionBackendEnum.CUSTOM``, so the v1 selector picked
+``FlashAttentionBackend`` for every layer, ``bind_runtime`` filtered them all
+out (they failed ``layer.attn_backend is cls``), no layer received a
+TierManager, and the assertions below tripped.
 
-The test is committed as ``xfail(strict=False)`` so it surfaces the gap in
-every e2e run without blocking the suite. When integration is fixed
-(``enable_quest_sparse_offload`` should auto-set ``attention_config.backend``
-to ``CUSTOM`` *and* propagate ``use_sparse=True`` so ``validate_configuration``
-accepts), this test will XPASS and the marker can be removed.
+That integration is now fixed: ``enable_quest_sparse_offload`` auto-sets the
+attention backend to ``CUSTOM`` (engine log shows ``Using
+AttentionBackendEnum.CUSTOM backend``) and propagates ``use_sparse`` so
+``validate_configuration`` accepts. The xfail marker has been removed and the
+test is a **hard pass** — verified 2026-06-02 on Llama-3.2-3B
+(``HF_HUB_OFFLINE=1``): TierManagers attach and ``select_calls`` /
+``selected_total`` / ``selected_on_gpu`` are all > 0.
 """
 
 from __future__ import annotations
