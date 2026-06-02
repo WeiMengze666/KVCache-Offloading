@@ -75,8 +75,9 @@ def test_quest_spec_copy_with_new_block_size_preserves_budget():
 def test_quest_spec_savings_vs_full_attention():
     """Sanity: at gpu_budget=32 for a 32k-context model the Quest per-layer
     feasibility METRIC is >=70% smaller than FullAttentionSpec's. This is a
-    feasibility/concurrency number (Def-2), NOT a reserved-pool cut — the
-    physical reserved GPU pool stays global either way."""
+    feasibility/concurrency number (a working-set metric), NOT a footprint /
+    reserved-pool cut — the physical reserved GPU pool stays global either way.
+    See CLAUDE.md "显存术语" for the footprint / resident-set / working-set model."""
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         QuestKVCacheSpec,

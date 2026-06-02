@@ -600,15 +600,23 @@ class MambaSpec(KVCacheSpec):
 class QuestKVCacheSpec(AttentionSpec):
     """Per-layer KV cache spec for layers handled by the Quest backend.
 
-    Def-2 framing (Stage 2A): vLLM reserves ONE global physical KV pool sized
-    to gpu_memory_utilization; `num_blocks` is a single global value and every
-    layer's KV tensor is `page_size * num_blocks`. This spec does NOT shrink
-    that reserved pool. Instead, the Quest backend bounds RESIDENCY: each Quest
-    layer keeps only `gpu_cache_blocks_per_seq` blocks per sequence resident in
-    a private GPU arena (see QuestSparseOffloadBackend.init_runtime_state),
-    spilling the rest to pinned host memory (CpuKvBackingStore). The win is
-    higher achievable concurrency / longer context at the same reserved GPU
-    bytes — more/longer sequences fit — NOT a smaller reserved peak.
+    Memory terminology (SSOT: CLAUDE.md "显存术语"; supersedes the old Def-1/Def-2).
+    vLLM reserves ONE global physical KV pool sized to gpu_memory_utilization:
+    `KVCacheConfig.num_blocks` is a single global value (init-fixed) and the
+    physical layout is `page_size * num_blocks` per shared buffer. This spec does
+    NOT shrink that **physical reservation (footprint)**. What the Quest backend
+    bounds is the **working set**: each Quest layer keeps only
+    `gpu_cache_blocks_per_seq` blocks per sequence in a private GPU arena (see
+    QuestSparseOffloadBackend.init_runtime_state), spilling the rest to pinned
+    host memory (CpuKvBackingStore).
+
+    NOTE (Stage 2A is transitional): bounding the working set does NOT yet reduce
+    footprint or even the resident-peak — Stage 2A keeps the full engine pool
+    reserved AND adds the arena (net increase), and does not reclaim the engine
+    blocks it trims (they remain resident dead blocks). Reducing the actual
+    footprint is deferred work (lower gpu_memory_utilization + Quest-owned
+    addressing). See CLAUDE.md for the full footprint / resident-set / working-set
+    model and the two gaps (gap_util, gap_offload).
     """
 
     gpu_cache_blocks_per_seq: int
@@ -627,10 +635,10 @@ class QuestKVCacheSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         # Feasibility/concurrency metric ONLY — NOT a physical allocation
         # directive. The reserved GPU pool is global (sized to
-        # gpu_memory_utilization, num_blocks * page_size per layer); this value
-        # is consulted only by feasibility/concurrency checks. Quest's saving is
-        # bounded residency (gpu_cache_blocks_per_seq blocks/seq resident), not a
-        # smaller tensor. See the class docstring (Def-2).
+        # gpu_memory_utilization, num_blocks * page_size); this value is
+        # consulted only by feasibility/concurrency checks. Quest bounds the
+        # WORKING SET (gpu_cache_blocks_per_seq blocks/seq in the arena), not the
+        # physical footprint. See the class docstring + CLAUDE.md "显存术语".
         return self.gpu_cache_blocks_per_seq * self.page_size_bytes
 
 
