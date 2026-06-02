@@ -49,7 +49,7 @@ def _reduce(block: torch.Tensor) -> torch.Tensor:
     return (block.float() * sign.view(bs, 1, 1).float()).sum(dim=0)
 
 
-def _build_tm(cap, bs, h, d, max_blocks):
+def _build_tm(cap, bs, h, d, max_blocks, write_through=False):
     from vllm.v1.attention.backends.quest.cache.block_summary import BlockSummaryStore
     from vllm.v1.attention.backends.quest.cache.cpu_backing_store import CpuKvBackingStore
     from vllm.v1.attention.backends.quest.cache.residency import BlockResidency
@@ -67,6 +67,7 @@ def _build_tm(cap, bs, h, d, max_blocks):
         gpu_v=torch.empty(cap, bs, h, d, dtype=torch.float16, device="cuda"),
         summary_store=summary, residency=res, cpu_store=cpu,
         gpu_pool_aliases_kv_cache=False,
+        enable_write_through=write_through,
     )
 
 
@@ -84,13 +85,15 @@ def _engine_kv_with_fingerprints(num_blocks, bs, h, d):
     return kv
 
 
+@pytest.mark.parametrize("write_through", [False, True])
 @pytest.mark.parametrize("seed", list(range(8)))
-def test_offload_lru_content_roundtrip(seed):
+def test_offload_lru_content_roundtrip(seed, write_through):
     """Drive the exact engine per-step sequence over many decode steps that
     cross block boundaries, with random top_k <= cap-1 each step, and after
     every step assert each selected block's arena slot still holds THAT block's
     fingerprint (so the offload + two-pass ensure_resident round trip is
-    content-lossless and never KeyErrors)."""
+    content-lossless and never KeyErrors). Parametrized over write-back (2A,
+    write_through=False) and write-through (2B): both must be lossless."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     from vllm.v1.attention.backends.quest.cache.tier_manager import TierManager  # noqa: F401
@@ -101,7 +104,7 @@ def test_offload_lru_content_roundtrip(seed):
     n_steps = 40                 # enough decode steps to cross several boundaries
     max_blocks = P0 + n_steps + 4
     engine = _engine_kv_with_fingerprints(max_blocks, bs, h, d)
-    tm = _build_tm(cap, bs, h, d, max_blocks)
+    tm = _build_tm(cap, bs, h, d, max_blocks, write_through=write_through)
     # identity block_table: logical b -> engine slot b
     block_table_row = list(range(max_blocks))
     seq_id = 0

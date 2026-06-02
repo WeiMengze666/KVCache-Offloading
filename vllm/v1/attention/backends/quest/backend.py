@@ -330,6 +330,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 enable_overlap_capture=quest_config.enable_debug_counters,
                 gpu_pool_aliases_kv_cache=pool_aliases_kv_cache,
                 engine_kv_cache=engine_kv_for_layer,
+                enable_write_through=quest_config.enable_write_through,
             )
             layer._quest_selection_callable_ref = selection_callable
 

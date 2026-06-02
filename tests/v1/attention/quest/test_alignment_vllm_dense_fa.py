@@ -94,8 +94,11 @@ _LONG_PROMPT = (
 ) * 60 + "\nQ: In what year was the Eiffel Tower completed?\nA:"
 
 # Same as _SHARED_KWARGS but with a longer context window so the long prompt
-# fits and the sequence spans well over SMALL_CAP blocks.
-_LONG_KWARGS = dict(_SHARED_KWARGS, max_model_len=4096)
+# fits and the sequence spans well over SMALL_CAP blocks. max_num_seqs=1 pins
+# the engine to the concurrency=1 scope the Quest offload design targets — and
+# is what makes Stage 2B write-through's host-pool sizing satisfiable (need =
+# cdiv(max_model_len, block_size) * max_num_seqs = 16 blocks/layer, not 4096).
+_LONG_KWARGS = dict(_SHARED_KWARGS, max_model_len=4096, max_num_seqs=1)
 
 
 def _engine_worker_long(out_path: str, quest_json_path: str) -> None:
@@ -207,3 +210,74 @@ def test_quest_offload_reload_lossless_small_vs_large_arena(tmp_path):
     small = quest_text(SMALL_CAP)
     big = quest_text(512)
     assert small.strip() == big.strip(), f"small={small!r} big={big!r}"
+
+
+@pytest.mark.slow_test
+def test_quest_write_through_offload_lossless_small_vs_large_arena(tmp_path):
+    """Stage 2B: same as the offload round-trip proof above, but BOTH engines
+    run with enable_write_through=True. A small cap forces eviction (now a
+    GPU-slot drop, the host backup mirrored at fill) + H2D reload; equal greedy
+    text vs a large cap that never spills proves the write-through
+    fill-mirror -> drop -> reload round trip is lossless."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if os.environ.get("VLLM_QUEST_RUN_ALIGNMENT") != "1":
+        pytest.skip("set VLLM_QUEST_RUN_ALIGNMENT=1 to run this slow test")
+    from vllm.config.quest import QuestConfig
+
+    SMALL_CAP, TOP_K = 8, 6  # top_k <= cap-1 (6 <= 7); arena = 6 selected + 1 live
+
+    def quest_text(cap):
+        cfg = QuestConfig(enabled=True, top_k=TOP_K, gpu_cache_blocks_per_seq=cap,
+                          full_kv_layers=[0, 1], block_size=256,
+                          cpu_cache_blocks=8192, cpu_cache_gib=8,
+                          selection_impl="torch", enable_async_prefetch=False,
+                          enable_write_through=True)
+        cfg.validate()
+        p = tmp_path / f"wt_cfg_{cap}.json"
+        p.write_text(json.dumps(cfg.to_dict()))
+        out = tmp_path / f"wt_q_{cap}.json"
+        _run_long_engine_in_subprocess(str(out), str(p))
+        return json.loads(out.read_text())["text"]
+
+    small = quest_text(SMALL_CAP)
+    big = quest_text(512)
+    assert small.strip() == big.strip(), (
+        f"write-through small={small!r} big={big!r}"
+    )
+
+
+@pytest.mark.slow_test
+def test_quest_write_through_lossless_vs_writeback(tmp_path):
+    """Stage 2B primary correctness guard: two real engines, SAME top_k / cap /
+    prompt, one enable_write_through=True and one False. Equal greedy text
+    proves write-through is an equal-correctness alternative to the 2A
+    write-back default (write-through == write-back == correct). The small cap
+    + _LONG_PROMPT guarantees spill/eviction actually fires on both paths."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if os.environ.get("VLLM_QUEST_RUN_ALIGNMENT") != "1":
+        pytest.skip("set VLLM_QUEST_RUN_ALIGNMENT=1 to run this slow test")
+    from vllm.config.quest import QuestConfig
+
+    CAP, TOP_K = 8, 6  # top_k <= cap-1; small enough to force eviction
+
+    def quest_text(write_through):
+        cfg = QuestConfig(enabled=True, top_k=TOP_K, gpu_cache_blocks_per_seq=CAP,
+                          full_kv_layers=[0, 1], block_size=256,
+                          cpu_cache_blocks=8192, cpu_cache_gib=8,
+                          selection_impl="torch", enable_async_prefetch=False,
+                          enable_write_through=write_through)
+        cfg.validate()
+        tag = "wt" if write_through else "wb"
+        p = tmp_path / f"vs_cfg_{tag}.json"
+        p.write_text(json.dumps(cfg.to_dict()))
+        out = tmp_path / f"vs_q_{tag}.json"
+        _run_long_engine_in_subprocess(str(out), str(p))
+        return json.loads(out.read_text())["text"]
+
+    write_through = quest_text(True)
+    write_back = quest_text(False)
+    assert write_through.strip() == write_back.strip(), (
+        f"write_through={write_through!r} write_back={write_back!r}"
+    )
