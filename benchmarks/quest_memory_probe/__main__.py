@@ -138,15 +138,6 @@ def args_to_configs(args) -> list[RunConfig]:
     return _apply_common(cfgs, args)
 
 
-def _run_in_child(cfg_dict: dict, out_dir_str: str) -> None:
-    # Re-import inside the child so we don't accidentally import vllm in parent.
-    from benchmarks.quest_memory_probe.configs import RunConfig
-    from benchmarks.quest_memory_probe.runner import execute
-
-    cfg = RunConfig.from_dict(cfg_dict)
-    execute(cfg, Path(out_dir_str))
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfgs = args_to_configs(args)
@@ -163,11 +154,13 @@ def main(argv: list[str] | None = None) -> int:
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     ctx = mp.get_context("spawn")
+    from benchmarks.quest_memory_probe.runner import run_in_child
+
     for c in cfgs:
         print(f"[main] launching cfg={c.name}", flush=True)
         t0 = time.perf_counter()
         proc = ctx.Process(
-            target=_run_in_child,
+            target=run_in_child,
             args=(c.to_dict(), str(out_dir)),
             name=f"runner-{c.name}",
         )

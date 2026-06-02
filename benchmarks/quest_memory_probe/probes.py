@@ -45,8 +45,11 @@ def _collect_tier_managers(worker) -> list[Any]:
     """Return [TierManager, ...] for all quest layers, or [] if not Quest.
 
     Tries `model_runner.quest_tier_managers_for_probe()` first; if that helper
-    is not present, scans `model_runner.attn_layers` for `impl.tier_manager`.
-    Tolerates dense engines (returns []).
+    is not present, scans the runner's `compilation_config.static_forward_context`
+    (vLLM v1's authoritative store of attention layers, see
+    `vllm/v1/worker/gpu_model_runner.py:946`) and falls back to the legacy
+    `attn_layers` / `attention_layers` / `_attn_layers` attributes for older
+    vLLM revisions. Tolerates dense engines (returns []).
     """
     runner = getattr(worker, "model_runner", None)
     if runner is None:
@@ -54,19 +57,53 @@ def _collect_tier_managers(worker) -> list[Any]:
     helper = getattr(runner, "quest_tier_managers_for_probe", None)
     if helper is not None:
         return list(helper())
-    # Try several attribute names where vLLM might keep attention layers.
+
+    out: list[Any] = []
+
+    def _tm_of(layer):
+        # Quest stores tier_manager directly on the Attention layer module
+        # (see vllm/v1/attention/backends/quest/impl.py:95). Older drafts
+        # tucked it under layer.impl; check both.
+        tm = getattr(layer, "tier_manager", None)
+        if tm is None:
+            impl = getattr(layer, "impl", None)
+            tm = getattr(impl, "tier_manager", None)
+        return tm
+
+    # vLLM v1 path: attention layers live in compilation_config.static_forward_context
+    cc = getattr(runner, "compilation_config", None)
+    sfc = getattr(cc, "static_forward_context", None) if cc is not None else None
+    if sfc:
+        for layer in sfc.values():
+            tm = _tm_of(layer)
+            if tm is not None:
+                out.append(tm)
+        if out:
+            return out
+
+    # Legacy fallbacks for older vLLM revisions.
     for attr in ("attn_layers", "attention_layers", "_attn_layers"):
         layers = getattr(runner, attr, None)
         if layers:
-            out = []
             for layer in layers:
-                impl = getattr(layer, "impl", None)
-                tm = getattr(impl, "tier_manager", None)
+                tm = _tm_of(layer)
                 if tm is not None:
                     out.append(tm)
             if out:
                 return out
     return []
+
+
+def _slot_map_size(tm) -> int:
+    sm = tm._slot_map
+    # _LRUSlotMap doesn't expose len(); read its internal OrderedDict.
+    inner = getattr(sm, "_key_to_slot", None)
+    if inner is not None:
+        return len(inner)
+    # Fall back to size() if a future version adds it.
+    if hasattr(sm, "size"):
+        return int(sm.size())
+    return 0
 
 
 def _aggregate_quest(tms: list[Any]) -> dict[str, Any]:
@@ -81,7 +118,7 @@ def _aggregate_quest(tms: list[Any]) -> dict[str, Any]:
             "quest.selected_on_gpu": None,
             "quest.topk_hit_ratio": None,
         }
-    gpu_blocks = sum(tm._slot_map.size() for tm in tms)
+    gpu_blocks = sum(_slot_map_size(tm) for tm in tms)
     cpu_blocks = sum(len(tm._cpu_slots) for tm in tms)
     evict_d2h = sum(tm._stats.evict_d2h for tm in tms)
     load_h2d = sum(tm._stats.load_h2d for tm in tms)
