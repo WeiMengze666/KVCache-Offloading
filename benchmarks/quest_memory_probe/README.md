@@ -23,7 +23,7 @@ HF_HUB_OFFLINE=1 PATH="$PWD/.venv/bin:$PATH" \
     --samples longbench:narrativeqa:lengths=short,medium:n=2 \
     --top-k 16 \
     --quest-pool 128 \
-    --out-dir /tmp/quest_mem_probe/$(date +%Y%m%d-%H%M%S)
+    --out-dir results/$(date +%Y%m%d-%H%M%S)
 ```
 
 ### B. Pool size sweep（看卸载激烈程度对显存的影响）
@@ -35,7 +35,7 @@ HF_HUB_OFFLINE=1 PATH="$PWD/.venv/bin:$PATH" \
     --samples longbench:narrativeqa:lengths=short,medium:n=2 \
     --top-k 16 \
     --pool-sizes 512,256,128,32,16 \
-    --out-dir /tmp/quest_mem_probe/$(date +%Y%m%d-%H%M%S)
+    --out-dir results/$(date +%Y%m%d-%H%M%S)
 ```
 
 ### C. OOM threshold sweep
@@ -47,7 +47,7 @@ HF_HUB_OFFLINE=1 PATH="$PWD/.venv/bin:$PATH" \
     --samples longbench:narrativeqa:lengths=short,medium,long:n=4 \
     --top-k 16 \
     --quest-pool 128 \
-    --out-dir /tmp/quest_mem_probe/$(date +%Y%m%d-%H%M%S)
+    --out-dir results/$(date +%Y%m%d-%H%M%S)
 ```
 
 ## 强制 synthetic 模式
