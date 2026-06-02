@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """BlockSummaryStore: incremental amax/amin per filled block."""
+
 from __future__ import annotations
 
 import pytest
@@ -38,9 +40,13 @@ def test_on_block_filled_matches_naive_amax_amin(cuda):
     h_kv = 2
     d = 64
     store = BlockSummaryStore(
-        num_layers=2, max_blocks=8,
-        block_size=block_size, num_kv_heads=h_kv, head_size=d,
-        dtype=torch.float16, device="cuda",
+        num_layers=2,
+        max_blocks=8,
+        block_size=block_size,
+        num_kv_heads=h_kv,
+        head_size=d,
+        dtype=torch.float16,
+        device="cuda",
     )
 
     k_block = torch.randn(block_size, h_kv, d, dtype=torch.float16, device="cuda")
@@ -48,7 +54,7 @@ def test_on_block_filled_matches_naive_amax_amin(cuda):
 
     expected_max = k_block.amax(dim=0)
     expected_min = k_block.amin(dim=0)
-    got = store.summary[1, 3]   # [2, h_kv, d]
+    got = store.summary[1, 3]  # [2, h_kv, d]
     assert torch.equal(got[0], expected_max)
     assert torch.equal(got[1], expected_min)
 
@@ -59,9 +65,13 @@ def test_gather_returns_subset_in_order(cuda):
     )
 
     store = BlockSummaryStore(
-        num_layers=1, max_blocks=8,
-        block_size=4, num_kv_heads=1, head_size=8,
-        dtype=torch.float32, device="cuda",
+        num_layers=1,
+        max_blocks=8,
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float32,
+        device="cuda",
     )
     for i in range(8):
         k = torch.full((4, 1, 8), float(i), dtype=torch.float32, device="cuda")
@@ -81,9 +91,13 @@ def test_overwrite_reuses_slot(cuda):
     )
 
     store = BlockSummaryStore(
-        num_layers=1, max_blocks=4,
-        block_size=4, num_kv_heads=1, head_size=2,
-        dtype=torch.float32, device="cuda",
+        num_layers=1,
+        max_blocks=4,
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+        device="cuda",
     )
     a = torch.full((4, 1, 2), 1.0, dtype=torch.float32, device="cuda")
     b = torch.full((4, 1, 2), 5.0, dtype=torch.float32, device="cuda")
@@ -101,13 +115,60 @@ def test_capacity_validation():
 
     with pytest.raises(ValueError, match="num_layers"):
         BlockSummaryStore(
-            num_layers=0, max_blocks=8,
-            block_size=4, num_kv_heads=1, head_size=2,
-            dtype=torch.float32, device="cuda",
+            num_layers=0,
+            max_blocks=8,
+            block_size=4,
+            num_kv_heads=1,
+            head_size=2,
+            dtype=torch.float32,
+            device="cuda",
         )
     with pytest.raises(ValueError, match="max_blocks"):
         BlockSummaryStore(
-            num_layers=1, max_blocks=0,
-            block_size=4, num_kv_heads=1, head_size=2,
-            dtype=torch.float32, device="cuda",
+            num_layers=1,
+            max_blocks=0,
+            block_size=4,
+            num_kv_heads=1,
+            head_size=2,
+            dtype=torch.float32,
+            device="cuda",
         )
+
+
+def test_block_summary_default_mode_is_quest_minmax(cuda):
+    from vllm.v1.attention.backends.quest.cache.block_summary import (
+        BlockSummaryStore,
+    )
+
+    store = BlockSummaryStore(
+        num_layers=1,
+        max_blocks=2,
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    assert store.digest_mode == "quest_minmax"
+
+
+def test_block_summary_quest_minmax_writes_amax_amin(cuda):
+    from vllm.v1.attention.backends.quest.cache.block_summary import (
+        BlockSummaryStore,
+    )
+
+    torch.manual_seed(0)
+    store = BlockSummaryStore(
+        num_layers=1,
+        max_blocks=2,
+        block_size=4,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.float16,
+        device="cuda",
+        digest_mode="quest_minmax",
+    )
+    k = torch.randn(4, 2, 8, dtype=torch.float16, device="cuda")
+    store.on_block_filled(0, 0, k)
+    torch.testing.assert_close(store.summary[0, 0, 0], k.amax(dim=0))
+    torch.testing.assert_close(store.summary[0, 0, 1], k.amin(dim=0))
