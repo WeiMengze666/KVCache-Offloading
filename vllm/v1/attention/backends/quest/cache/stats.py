@@ -10,6 +10,7 @@ from dataclasses import dataclass
 class QuestStats:
     block_filled: int = 0
     evict_d2h: int = 0
+    evict_drop: int = 0    # write-through evictions: GPU slot dropped, no D2H
     load_h2d: int = 0
     select_calls: int = 0
     selected_total: int = 0

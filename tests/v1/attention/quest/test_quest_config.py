@@ -79,6 +79,42 @@ def test_quest_config_to_dict_round_trip():
     assert restored == original
 
 
+def test_quest_config_write_through_roundtrip():
+    """Stage 2B: enable_write_through defaults False and survives to_dict /
+    from_dict so a JSON --quest-config can flip it on."""
+    from vllm.config.quest import QuestConfig
+
+    default = QuestConfig()
+    assert default.enable_write_through is False
+    assert default.to_dict()["enable_write_through"] is False
+
+    on = QuestConfig(enabled=True, enable_write_through=True)
+    d = on.to_dict()
+    assert d["enable_write_through"] is True
+    restored = QuestConfig.from_dict(d)
+    assert restored.enable_write_through is True
+    assert restored == on
+
+
+def test_quest_config_write_through_validates_bool():
+    """validate() rejects a non-bool enable_write_through (config-time guard)."""
+    from vllm.config.quest import QuestConfig
+
+    with pytest.raises(ValueError, match="enable_write_through"):
+        QuestConfig(enabled=True, enable_write_through="yes").validate()
+
+
+def test_quest_stats_has_evict_drop():
+    """Write-through evictions only drop the GPU slot (host backup exists);
+    they count as evict_drop, distinct from write-back's evict_d2h."""
+    from vllm.v1.attention.backends.quest.cache.stats import QuestStats
+
+    s = QuestStats()
+    assert s.evict_drop == 0
+    s.evict_drop += 1
+    assert s.evict_drop == 1
+
+
 def test_vllm_config_has_quest_config_field_default_none():
     from vllm.config import VllmConfig
     import dataclasses

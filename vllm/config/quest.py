@@ -156,6 +156,11 @@ class QuestConfig:
                 "prefetch_window_blocks > 0 (Mode 2) requires "
                 "enable_async_prefetch=True (Mode 1)."
             )
+        if not isinstance(self.enable_write_through, bool):
+            raise ValueError(
+                f"enable_write_through must be a bool, "
+                f"got {self.enable_write_through!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
