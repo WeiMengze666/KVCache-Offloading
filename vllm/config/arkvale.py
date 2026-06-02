@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""QuestConfig: configuration for the Quest sparse offload attention backend.
+"""ArkValeConfig: configuration for the ArkVale (cuboid_mean) sparse selector.
 
-Phase A only carries plumbing. Tiering / async / kernel fields are present so
-later phases can flip them without re-introducing config-shape churn — but
-they are validated and have safe defaults that keep Phase A behavior equal to
-FlashAttention with the gate flipped.
+ArkVale shares the entire QuestSparseOffloadBackend, BlockSummaryStore,
+and KV tiering / CPU offload stack with Quest. The only algorithmic
+difference is the page-digest formula, controlled by `digest_mode`
+(default 'arkvale_cuboid_mean'). All other fields mirror QuestConfig.
 """
 
 from __future__ import annotations
@@ -20,27 +20,28 @@ DigestMode = Literal["quest_minmax", "arkvale_cuboid_mean"]
 
 
 @dataclass
-class QuestConfig:
+class ArkValeConfig:
     enabled: bool = False
-    backend_name: str = "QUEST_SPARSE_OFFLOAD"
+    backend_name: str = "ARKVALE_SPARSE_OFFLOAD"
 
-    # Quest algorithm (Phase B activates these).
+    # Algorithm
     block_size: int = 32
     top_k: int = 64
     full_kv_layers: list[int] = field(default_factory=lambda: [0, 1])
-    digest_mode: DigestMode = "quest_minmax"
-    """Page digest formula. 'quest_minmax' = true K amax/amin (Quest, default).
+    digest_mode: DigestMode = "arkvale_cuboid_mean"
+    """Page digest formula. Differs from QuestConfig: defaults to 'arkvale_cuboid_mean'.
+    'quest_minmax' = true K amax/amin (Quest, default).
     'arkvale_cuboid_mean' = center +/- mean(|K - center|) where
     center = (true_max + true_min) / 2 (ArkVale cuboid-mean variant).
 
     The digest tensor layout is identical for both modes — selection ops
     and CPU offload are unaware of which formula produced the values."""
 
-    # GPU/CPU tiering (Phase B activates these).
+    # GPU/CPU tiering
     gpu_cache_blocks_per_seq: int = 256
     cpu_cache_blocks: int = 65536
     cpu_cache_gib: int | None = None
-    """Total pinned CPU pool budget in GiB across ALL Quest layers.
+    """Total pinned CPU pool budget in GiB across ALL ArkVale layers.
 
     When set, the runtime computes `floor(cpu_cache_gib * 1024**3 /
     page_size_bytes / num_quest_layers)` and takes the min with
@@ -52,7 +53,7 @@ class QuestConfig:
     configuration."""
     eviction_policy: EvictionPolicy = "lru"
 
-    # Async (Phase C activates these).
+    # Async (Phase C)
     enable_async_prefetch: bool = False
     """Phase C gate. When True, ensure_resident issues non_blocking=True H2D
     on a dedicated h2d_stream and returns an event for the compute stream
@@ -62,7 +63,7 @@ class QuestConfig:
 
     enable_double_buffering: bool = False
     """Phase C reserved. Currently unused — the Phase C design uses a single
-    h2d/d2h stream pair without staging buffers (each Quest layer has its
+    h2d/d2h stream pair without staging buffers (each ArkVale layer has its
     own GPU pool, so layer-N forward and H2D into layer-N+1 don't conflict).
     Reserved for future expansion."""
 
@@ -87,7 +88,7 @@ class QuestConfig:
        the worst case (zero overlap between speculation and reality),
        Mode 2 can be 2x slower than Mode 1.
 
-       Quest's cross-layer top-k overlap is workload-dependent and has
+       ArkVale's cross-layer top-k overlap is workload-dependent and has
        not been measured for this project. **Do not enable Mode 2
        (prefetch_window_blocks > 0) in production without first
        benchmarking the overlap fraction on your model.** Phase D may
@@ -95,13 +96,13 @@ class QuestConfig:
        at 0.
     """
 
-    # Kernel dispatch (Phase D activates "cuda").
+    # Kernel
     selection_impl: SelectionImpl = "torch"
 
-    # Debug.
+    # Debug
     enable_debug_counters: bool = False
 
-    # Compatibility behavior when the loaded model isn't whitelisted.
+    # Compatibility
     unsupported_model_policy: UnsupportedModelPolicy = "error"
 
     def validate(self) -> None:
@@ -162,7 +163,7 @@ class QuestConfig:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> QuestConfig:
+    def from_dict(cls, data: dict[str, Any]) -> ArkValeConfig:
         return cls(**data)
 
     def resolve_cpu_blocks_per_layer(

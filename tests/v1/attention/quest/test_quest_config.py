@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for QuestConfig dataclass."""
+
 from __future__ import annotations
 
 import pytest
@@ -80,8 +82,9 @@ def test_quest_config_to_dict_round_trip():
 
 
 def test_vllm_config_has_quest_config_field_default_none():
-    from vllm.config import VllmConfig
     import dataclasses
+
+    from vllm.config import VllmConfig
 
     fields = {f.name for f in dataclasses.fields(VllmConfig)}
     assert "quest_config" in fields, (
@@ -145,7 +148,8 @@ def test_resolve_cpu_pool_blocks_legacy_only():
 
     cfg = QuestConfig(cpu_cache_blocks=128, cpu_cache_gib=None)
     blocks_per_layer = cfg.resolve_cpu_blocks_per_layer(
-        page_size_bytes=1024 * 1024, num_quest_layers=30,
+        page_size_bytes=1024 * 1024,
+        num_quest_layers=30,
     )
     assert blocks_per_layer == 128
 
@@ -154,9 +158,13 @@ def test_resolve_cpu_pool_zero_quest_layers_returns_zero():
     from vllm.config.quest import QuestConfig
 
     cfg = QuestConfig()
-    assert cfg.resolve_cpu_blocks_per_layer(
-        page_size_bytes=1024 * 1024, num_quest_layers=0,
-    ) == 0
+    assert (
+        cfg.resolve_cpu_blocks_per_layer(
+            page_size_bytes=1024 * 1024,
+            num_quest_layers=0,
+        )
+        == 0
+    )
 
 
 def test_prefetch_window_requires_async_enabled():
@@ -164,22 +172,54 @@ def test_prefetch_window_requires_async_enabled():
     from vllm.config.quest import QuestConfig
 
     # Async + window > 0: ok (Mode 2).
-    QuestConfig(enabled=True, enable_async_prefetch=True,
-                prefetch_window_blocks=4).validate()
+    QuestConfig(
+        enabled=True, enable_async_prefetch=True, prefetch_window_blocks=4
+    ).validate()
 
     # Async + window 0: ok (Mode 1).
-    QuestConfig(enabled=True, enable_async_prefetch=True,
-                prefetch_window_blocks=0).validate()
+    QuestConfig(
+        enabled=True, enable_async_prefetch=True, prefetch_window_blocks=0
+    ).validate()
 
     # Sync + window > 0: rejected.
     with pytest.raises(ValueError, match="enable_async_prefetch"):
-        QuestConfig(enabled=True, enable_async_prefetch=False,
-                    prefetch_window_blocks=4).validate()
+        QuestConfig(
+            enabled=True, enable_async_prefetch=False, prefetch_window_blocks=4
+        ).validate()
 
 
 def test_prefetch_window_negative_rejected():
     from vllm.config.quest import QuestConfig
 
     with pytest.raises(ValueError, match="prefetch_window_blocks"):
-        QuestConfig(enabled=True,
-                    prefetch_window_blocks=-1).validate()
+        QuestConfig(enabled=True, prefetch_window_blocks=-1).validate()
+
+
+def test_quest_config_digest_mode_default():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig()
+    assert cfg.digest_mode == "quest_minmax"
+
+
+def test_quest_config_digest_mode_arkvale_value_accepted():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(digest_mode="arkvale_cuboid_mean")
+    cfg.validate()  # should not raise
+
+
+def test_quest_config_digest_mode_invalid_rejected():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(digest_mode="bogus")
+    with pytest.raises(ValueError, match="digest_mode"):
+        cfg.validate()
+
+
+def test_quest_config_digest_mode_round_trip():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(digest_mode="arkvale_cuboid_mean")
+    cfg2 = QuestConfig.from_dict(cfg.to_dict())
+    assert cfg2.digest_mode == "arkvale_cuboid_mean"

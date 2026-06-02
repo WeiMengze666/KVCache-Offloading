@@ -295,3 +295,79 @@ def test_overlap_capture_noop_when_disabled():
     tm = _build(gpu_budget=8, enable_overlap_capture=False)
     tm.record_selected(step=0, seq_id=0, block_ids=[1, 2, 3])
     assert tm.drain_selected() == []
+
+
+def test_spill_hook_is_called_on_eviction():
+    """When the arena is full, on_block_filled evicts LRU and the spill goes
+    through the pluggable spill_hook (so Stage 2B can swap write-through in)."""
+    import torch, pytest
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from vllm.v1.attention.backends.quest.cache.tier_manager import TierManager
+    from vllm.v1.attention.backends.quest.cache.block_summary import BlockSummaryStore
+    from vllm.v1.attention.backends.quest.cache.cpu_backing_store import CpuKvBackingStore
+    from vllm.v1.attention.backends.quest.cache.residency import BlockResidency
+
+    cap, bs, h, d = 2, 256, 2, 64
+    summary = BlockSummaryStore(num_layers=1, max_blocks=16, block_size=bs,
+                                num_kv_heads=h, head_size=d,
+                                dtype=torch.float16, device="cuda")
+    cpu = CpuKvBackingStore(num_layers=1, blocks_per_layer=16, block_size=bs,
+                            num_kv_heads=h, head_size=d, dtype=torch.float16)
+    res = BlockResidency(num_layers=1, max_blocks=16)
+    tm = TierManager(layer_idx=0, gpu_budget=cap,
+                     gpu_k=torch.empty(cap, bs, h, d, dtype=torch.float16, device="cuda"),
+                     gpu_v=torch.empty(cap, bs, h, d, dtype=torch.float16, device="cuda"),
+                     summary_store=summary, residency=res, cpu_store=cpu,
+                     gpu_pool_aliases_kv_cache=False)
+    spilled = []
+    orig = tm._spill_to_cpu
+    def hook(seq_id, logical_block_id, *, slot):
+        spilled.append((seq_id, logical_block_id))
+        return orig(seq_id, logical_block_id, slot=slot)
+    tm.spill_hook = hook
+    blk = lambda: torch.randn(bs, h, d, dtype=torch.float16, device="cuda")
+    for b in range(cap + 1):  # cap fill, then one more => one eviction
+        tm.on_block_filled(seq_id=0, logical_block_id=b, k_block=blk(), v_block=blk())
+    assert spilled == [(0, 0)], f"LRU block (0,0) must spill via hook, got {spilled}"
+    assert tm.stats().evict_d2h == 1
+
+
+def test_trim_keeps_cap_minus_one_and_spills_rest():
+    import torch, pytest
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from vllm.v1.attention.backends.quest.cache.tier_manager import TierManager
+    from vllm.v1.attention.backends.quest.cache.block_summary import BlockSummaryStore
+    from vllm.v1.attention.backends.quest.cache.cpu_backing_store import CpuKvBackingStore
+    from vllm.v1.attention.backends.quest.cache.residency import BlockResidency
+
+    cap, bs, h, d, P = 4, 256, 2, 64, 10  # 10 full blocks, arena cap 4
+    nb = 16
+    engine = torch.randn(nb, 2, bs, h, d, dtype=torch.float16, device="cuda")
+    summary = BlockSummaryStore(num_layers=1, max_blocks=nb, block_size=bs,
+                                num_kv_heads=h, head_size=d, dtype=torch.float16, device="cuda")
+    cpu = CpuKvBackingStore(num_layers=1, blocks_per_layer=nb, block_size=bs,
+                            num_kv_heads=h, head_size=d, dtype=torch.float16)
+    res = BlockResidency(num_layers=1, max_blocks=nb)
+    tm = TierManager(layer_idx=0, gpu_budget=cap,
+                     gpu_k=torch.empty(cap, bs, h, d, dtype=torch.float16, device="cuda"),
+                     gpu_v=torch.empty(cap, bs, h, d, dtype=torch.float16, device="cuda"),
+                     summary_store=summary, residency=res, cpu_store=cpu,
+                     engine_kv_cache=engine, gpu_pool_aliases_kv_cache=False)
+    # identity block_table: logical b -> engine slot b
+    block_table_row = list(range(P))
+    tm.trim_to_working_set(seq_id=0, num_full_blocks=P, kv_cache=engine,
+                           block_table_row=block_table_row)
+    # arena holds the last cap-1 = 3 blocks: {7,8,9}; spilled = {0..6}
+    resident = {b for (s, b) in tm._slot_map._key_to_slot if s == 0}
+    assert resident == {7, 8, 9}, resident
+    assert tm.stats().evict_d2h == 7
+    # a kept block reads back equal to engine
+    slot = tm.logical_to_slot(0, 9)
+    assert torch.equal(tm.gpu_k[slot], engine[9, 0])
+    # a spilled block is reloadable
+    tm.ensure_resident(seq_id=0, logical_block_ids=torch.tensor([3], device="cuda"))
+    slot3 = tm.logical_to_slot(0, 3)
+    assert torch.equal(tm.gpu_k[slot3], engine[3, 0])
+    assert tm.stats().load_h2d == 1
