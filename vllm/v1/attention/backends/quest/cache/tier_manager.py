@@ -372,6 +372,160 @@ class TierManager:
         self.residency.mark_on_gpu(self.layer_idx, live_block_id)
         return slot
 
+    def prefill_ingest_kvshare(
+        self,
+        seq_id,
+        num_full_blocks: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        block_size: int,
+        prompt_len: int | None = None,
+    ) -> None:
+        """Stage 2C-v2: prefill-time per-layer offload sourced from THIS layer's
+        key/value (NOT a kv_cache tensor).
+
+        Under footprint_kvshare the engine never writes this layer's KV into a
+        per-layer cache (its slots are the shared scratch, overwritten by the
+        next layer), so the 2A path — engine writes all prompt blocks, then a
+        decode-time trim_to_working_set copies engine->arena — cannot work. This
+        method establishes the SAME bounded working set as that trim, but
+        directly from the key/value forward args:
+          - keep the last cap-1 full blocks in the arena (1 slot reserved for
+            the live decode block),
+          - spill the earlier blocks via the spill_hook (write-back D2H, or
+            write-through host mirror),
+          - register every full block's summary (selection needs it; it must
+            survive the spill),
+          - stage the trailing PARTIAL prompt block (if prompt_len is not a
+            block multiple) into the live arena slot keyed (seq, num_full_blocks)
+            WITHOUT a summary — it is the live block the first decode steps
+            continue filling (append_decode_token_kvshare).
+
+        key/value are this layer's prefill K/V, shape
+        (prompt_len [+ padding], num_kv_heads, head_size). Block b occupies rows
+        [b*block_size, (b+1)*block_size); the partial tail occupies
+        [num_full_blocks*block_size, prompt_len).
+
+        Idempotent per seq via _trimmed (the prefill runs once per request).
+        """
+        if seq_id in self._trimmed:
+            return
+        self._trimmed.add(seq_id)
+        keep_n = max(0, min(num_full_blocks, self._slot_map.capacity - 1))
+        keep_lo = num_full_blocks - keep_n  # keep [keep_lo, num_full_blocks)
+        for b in range(num_full_blocks):
+            lo = b * block_size
+            hi = lo + block_size
+            k_block = key[lo:hi]
+            v_block = value[lo:hi]
+            # Summary first — the only thing that must survive eviction.
+            self.summary_store.on_block_filled(self.layer_idx, b, k_block)
+            if b >= keep_lo:
+                # Keep in the arena. Reserved capacity guarantees no overflow.
+                slot, evicted = self._slot_map.add((seq_id, b))
+                assert evicted is None, (
+                    "kvshare prefill ingest must not overflow the arena"
+                )
+                self.gpu_k[slot].copy_(k_block, non_blocking=False)
+                self.gpu_v[slot].copy_(v_block, non_blocking=False)
+                self.residency.mark_on_gpu(self.layer_idx, b)
+                self._stats.block_filled += 1
+                if self.enable_write_through:
+                    self._mirror_to_host(seq_id, b, k_block, v_block)
+            elif self.enable_write_through:
+                # Spilled prompt block -> durable host backup, no GPU slot.
+                self._mirror_to_host(seq_id, b, k_block, v_block)
+                self.residency.begin_evict(self.layer_idx, b)
+                self.residency.complete_evict(self.layer_idx, b)
+            else:
+                # Write-back: spill straight to the CPU pool from key/value.
+                try:
+                    cpu_slot = self.cpu_store.alloc(self.layer_idx)
+                except RuntimeError as e:
+                    raise RuntimeError(
+                        f"Quest kvshare prefill: CPU pool exhausted spilling "
+                        f"{num_full_blocks - keep_n} blocks for seq {seq_id} "
+                        f"layer {self.layer_idx}; raise cpu_cache_blocks or use "
+                        f"a shorter prompt"
+                    ) from e
+                self.cpu_store.store_block(
+                    self.layer_idx, cpu_slot, k_block, v_block,
+                )
+                self._cpu_slots[(seq_id, b)] = cpu_slot
+                self.residency.begin_evict(self.layer_idx, b)
+                self.residency.complete_evict(self.layer_idx, b)
+                self._stats.evict_d2h += 1
+
+        # Trailing partial prompt block -> stage into the live arena slot so the
+        # first decode steps continue filling it. No summary (incomplete block,
+        # never a scoring candidate until promoted by append_decode_token).
+        if prompt_len is not None:
+            partial = prompt_len - num_full_blocks * block_size
+            if partial > 0:
+                live_id = num_full_blocks
+                slot, evicted = self._slot_map.add((seq_id, live_id))
+                if evicted is not None:
+                    self.spill_hook(*evicted, slot=slot)
+                lo = num_full_blocks * block_size
+                self.gpu_k[slot][:partial].copy_(
+                    key[lo:lo + partial], non_blocking=False,
+                )
+                self.gpu_v[slot][:partial].copy_(
+                    value[lo:lo + partial], non_blocking=False,
+                )
+                self.residency.mark_on_gpu(self.layer_idx, live_id)
+
+    def append_decode_token_kvshare(
+        self,
+        seq_id,
+        seq_len_before: int,
+        k_tok: torch.Tensor,
+        v_tok: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        """Stage 2C-v2: write ONE decode token's KV into the per-layer arena,
+        sourced from this layer's key/value (NOT the scratch — the engine never
+        wrote it there under kv-share).
+
+        ``seq_len_before`` is the sequence length BEFORE appending this token,
+        so the token lands at logical position ``seq_len_before`` in block
+        ``live_block_id = seq_len_before // block_size`` at intra-block offset
+        ``seq_len_before % block_size``.
+
+        The live block is staged in a re-touched (MRU-pinned) arena slot keyed
+        ``(seq_id, live_block_id)``; each step writes its single token into the
+        right row. When the token completes the block (offset == block_size-1),
+        the block is promoted to a normal full block in place: its summary is
+        registered (the data is already in the arena slot), so it becomes a
+        scoring candidate on subsequent steps. Same slot, same key — no copy,
+        no scratch round-trip.
+
+        k_tok/v_tok have shape (1, num_kv_heads, head_size).
+        """
+        live_block_id = seq_len_before // block_size
+        offset = seq_len_before % block_size
+        key = (seq_id, live_block_id)
+        # Ensure the live block has an MRU-pinned arena slot.
+        slot, evicted = self._slot_map.add(key)
+        if evicted is not None:
+            self.spill_hook(*evicted, slot=slot)
+        self.gpu_k[slot][offset].copy_(k_tok.reshape_as(self.gpu_k[slot][offset]),
+                                       non_blocking=False)
+        self.gpu_v[slot][offset].copy_(v_tok.reshape_as(self.gpu_v[slot][offset]),
+                                       non_blocking=False)
+        self.residency.mark_on_gpu(self.layer_idx, live_block_id)
+        if offset == block_size - 1:
+            # The block just completed — promote it to a full scoring block.
+            # Data already in gpu_k[slot]; register the summary from the arena.
+            self.summary_store.on_block_filled(
+                self.layer_idx, live_block_id, self.gpu_k[slot],
+            )
+            self._stats.block_filled += 1
+            if self.enable_write_through:
+                self._mirror_to_host(
+                    seq_id, live_block_id, self.gpu_k[slot], self.gpu_v[slot],
+                )
+
     def free_request(self, seq_id) -> None:
         """Release every TierManager state row keyed by ``seq_id``.
 

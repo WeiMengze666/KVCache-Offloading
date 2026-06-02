@@ -351,6 +351,10 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 enable_write_through=quest_config.enable_write_through,
             )
             layer._quest_selection_callable_ref = selection_callable
+            # Stash the config on every quest layer so impl.forward can read
+            # footprint_kvshare (Stage 2C-v2) without a global lookup. (Mode 2
+            # also sets this below for the registry path; harmless to set here.)
+            layer._quest_config_ref = quest_config
 
         # Mode 2 layer-registry: only when async is on AND prefetch window
         # is non-zero. Without these refs, run_sparse_decode's helpers

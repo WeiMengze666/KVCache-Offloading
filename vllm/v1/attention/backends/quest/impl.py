@@ -104,6 +104,22 @@ class QuestSparseOffloadImpl(AttentionImpl):
             # always delegate, regardless of phase. KV was already written by
             # the engine via do_kv_cache_update (forward_includes_kv_cache_update
             # is False) before this forward ran, so FA forward only reads.
+            #
+            # Stage 2C-v2 (footprint_kvshare): for a SHARED Quest layer the
+            # engine SKIPS do_kv_cache_update (kv_sharing_target guard), so the
+            # scratch tensor (== kv_cache here) is unwritten. We must write this
+            # layer's K/V into the scratch ourselves BEFORE delegating to FA, so
+            # FA prefill reads correct KV. The slot_mapping already targets the
+            # scratch slots (folded into the scratch group). Full-KV layers and
+            # the non-kvshare path are untouched (engine already wrote).
+            is_kvshare = (
+                not full_kv
+                and is_prefill
+                and self._is_kvshare_shared_layer(layer)
+            )
+            if is_kvshare:
+                self._kvshare_write_scratch(layer, key, value, kv_cache,
+                                            attn_metadata)
             out = self._fa_impl.forward(
                 layer,
                 query,
@@ -115,15 +131,21 @@ class QuestSparseOffloadImpl(AttentionImpl):
                 output_scale=output_scale,
                 output_block_scale=output_block_scale,
             )
-            # During prefill, hand newly completed blocks to the tier manager
-            # so the working set + summaries are up to date for the upcoming
-            # decode steps.
-            self._notify_filled_blocks_after_prefill(
-                layer,
-                key,
-                value,
-                attn_metadata,
-            )
+            if is_kvshare:
+                # Quest-owned per-layer offload, sourced from key/value (NOT the
+                # scratch, which the next layer overwrites). Establishes the
+                # bounded working set + summaries at prefill time.
+                self._kvshare_prefill_offload(layer, key, value, attn_metadata)
+            else:
+                # During prefill, hand newly completed blocks to the tier manager
+                # so the working set + summaries are up to date for the upcoming
+                # decode steps.
+                self._notify_filled_blocks_after_prefill(
+                    layer,
+                    key,
+                    value,
+                    attn_metadata,
+                )
             return out
 
         # Decode of a Quest layer. KV for this step was already written by the
@@ -131,11 +153,19 @@ class QuestSparseOffloadImpl(AttentionImpl):
         # straight to notifying filled blocks (reads from kv_cache) and the
         # sparse path — no manual reshape_and_cache_flash here (that would
         # double-write).
-        self._notify_filled_blocks_after_decode(
-            layer,
-            kv_cache,
-            attn_metadata,
-        )
+        #
+        # Stage 2C-v2: for a SHARED layer the engine wrote NOTHING (kv-share),
+        # so the arena live block must be filled from this step's key/value, not
+        # read back from the scratch. The sparse gather still reads only the
+        # arena, so only the WRITE side changes.
+        if not full_kv and self._is_kvshare_shared_layer(layer):
+            self._kvshare_decode_write(layer, key, value, attn_metadata)
+        else:
+            self._notify_filled_blocks_after_decode(
+                layer,
+                kv_cache,
+                attn_metadata,
+            )
         return self._forward_sparse_decode(
             layer,
             query,
@@ -196,3 +226,37 @@ class QuestSparseOffloadImpl(AttentionImpl):
         )
 
         return run_sparse_decode(self, layer, query, kv_cache, md, output)
+
+    # ----- Stage 2C-v2 (footprint_kvshare): Quest-owned KV write -----
+
+    def _is_kvshare_shared_layer(self, layer) -> bool:
+        """True iff this layer is a non-full-KV Quest layer that has been routed
+        out of HMA via kv-share (footprint_kvshare on AND a share target set at
+        construction). For these layers the engine skips the KV write, so Quest
+        owns it. False (the 2A/2B path) when footprint_kvshare is off or the
+        layer keeps its own KV (full-KV layers, the scratch layer)."""
+        if getattr(layer, "kv_sharing_target_layer_name", None) is None:
+            return False
+        qc = getattr(layer, "_quest_config_ref", None)
+        return bool(qc is not None and getattr(qc, "footprint_kvshare", False))
+
+    def _kvshare_write_scratch(self, layer, key, value, kv_cache, md):
+        from vllm.v1.attention.backends.quest.impl_helpers import (
+            kvshare_write_scratch,
+        )
+
+        kvshare_write_scratch(self, layer, key, value, kv_cache, md)
+
+    def _kvshare_prefill_offload(self, layer, key, value, md):
+        from vllm.v1.attention.backends.quest.impl_helpers import (
+            kvshare_prefill_offload,
+        )
+
+        kvshare_prefill_offload(layer, key, value, md)
+
+    def _kvshare_decode_write(self, layer, key, value, md):
+        from vllm.v1.attention.backends.quest.impl_helpers import (
+            kvshare_decode_write,
+        )
+
+        kvshare_decode_write(layer, key, value, md)

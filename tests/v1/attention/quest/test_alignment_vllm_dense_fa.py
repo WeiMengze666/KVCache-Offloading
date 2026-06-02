@@ -281,3 +281,82 @@ def test_quest_write_through_lossless_vs_writeback(tmp_path):
     assert write_through.strip() == write_back.strip(), (
         f"write_through={write_through!r} write_back={write_back!r}"
     )
+
+
+def _engine_worker_kvshare(out_path: str, quest_json_path: str | None) -> None:
+    """Stage 2C-v2 worker: short prompt + footprint_kvshare engine (Quest layers
+    routed out of HMA), or dense reference when quest_json_path is None."""
+    from vllm import LLM, SamplingParams
+
+    if quest_json_path is None:
+        llm = LLM(model=QUEST_E2E_MODEL_ID, **_SHARED_KWARGS)
+    else:
+        llm = LLM(
+            model=QUEST_E2E_MODEL_ID,
+            enable_quest_sparse_offload=True,
+            quest_config=quest_json_path,
+            **_SHARED_KWARGS,
+        )
+    sp = SamplingParams(max_tokens=8, temperature=0.0)
+    text = llm.generate([_PROMPT], sp, use_tqdm=False)[0].outputs[0].text
+    Path(out_path).write_text(json.dumps({"text": text}))
+
+
+def _run_kvshare_engine_in_subprocess(
+    out_path: str, quest_json_path: str | None
+) -> None:
+    ctx = mp.get_context("spawn")
+    p = ctx.Process(
+        target=_engine_worker_kvshare, args=(out_path, quest_json_path)
+    )
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        raise RuntimeError(
+            f"kvshare engine subprocess exited {p.exitcode} "
+            f"(quest={quest_json_path is not None})"
+        )
+
+
+@pytest.mark.slow_test
+def test_quest_footprint_kvshare_matches_dense_fa(tmp_path):
+    """Stage 2C-v2 PRIMARY correctness gate: Quest with footprint_kvshare=True
+    (non-full-KV layers routed out of HMA via kv-share, Quest owns their KV
+    write+offload) vs dense FA. With top_k larger than the prompt's block count,
+    selection degenerates to 'all blocks', so the sparse decode is numerically
+    equivalent to dense FA — and the Quest-owned write must reproduce exactly
+    what the engine would have written. Equal greedy text proves the kv-share
+    write+offload path is correct (the R1 invariant under footprint_kvshare)."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if os.environ.get("VLLM_QUEST_RUN_ALIGNMENT") != "1":
+        pytest.skip("set VLLM_QUEST_RUN_ALIGNMENT=1 to run this slow test")
+
+    from vllm.config.quest import QuestConfig
+
+    dense_out = tmp_path / "dense.json"
+    _run_kvshare_engine_in_subprocess(str(dense_out), None)
+    out_dense = json.loads(dense_out.read_text())["text"]
+
+    cfg = QuestConfig(
+        enabled=True,
+        top_k=64,
+        gpu_cache_blocks_per_seq=512,
+        full_kv_layers=[0, 1],
+        block_size=256,
+        cpu_cache_blocks=8192,
+        cpu_cache_gib=8,
+        selection_impl="torch",
+        enable_async_prefetch=False,
+        footprint_kvshare=True,
+    )
+    cfg.validate()
+    quest_cfg_path = tmp_path / "quest_kvshare_cfg.json"
+    quest_cfg_path.write_text(json.dumps(cfg.to_dict()))
+    quest_out = tmp_path / "quest_kvshare.json"
+    _run_kvshare_engine_in_subprocess(str(quest_out), str(quest_cfg_path))
+    out_quest = json.loads(quest_out.read_text())["text"]
+
+    assert out_dense.strip() == out_quest.strip(), (
+        f"dense={out_dense!r} kvshare={out_quest!r}"
+    )

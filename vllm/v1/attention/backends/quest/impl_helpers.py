@@ -15,6 +15,15 @@ if TYPE_CHECKING:
     )
 
 
+# Stage 2C-v2 INVARIANT-1 tripwire: maps scratch tensor data_ptr ->
+# [last_writer_layer_idx, offload_done_bool]. Set when a shared layer writes the
+# scratch (kvshare_write_scratch), flipped True when that layer's per-layer
+# offload completes (kvshare_prefill_offload). A non-serial executor would write
+# the scratch again before the prior offload finished — caught loudly. Only
+# touched on the footprint_kvshare prefill path; empty/unused otherwise.
+_SCRATCH_OWNER: dict[int, list] = {}
+
+
 @contextlib.contextmanager
 def _nvtx_range(name: str, enabled: bool):
     """NVTX range, no-op unless enabled (clean pass / default path stay clean).
@@ -161,6 +170,126 @@ def notify_filled_blocks_after_decode(layer, kv_cache, md) -> None:
                 k_block=k_cache_view[phys],
                 v_block=v_cache_view[phys],
             )
+
+
+def kvshare_write_scratch(impl, layer, key, value, kv_cache, md) -> None:
+    """Stage 2C-v2: write a SHARED Quest layer's prefill K/V into the scratch
+    tensor (== kv_cache) so FA's paged prefill can read it.
+
+    Under footprint_kvshare the engine skips do_kv_cache_update for shared
+    layers (kv_sharing_target guard), leaving the scratch unwritten. md's
+    slot_mapping already targets the scratch slots (the shared layer is folded
+    into the scratch group), so reusing it makes FA prefill read exactly the
+    rows we write. Scatter is byte-identical to the engine's own write
+    (reshape_and_cache_flash via FA's do_kv_cache_update).
+
+    Scratch-capacity guard (INVARIANT / temporary-design): the slot_mapping
+    indices must fall inside the scratch tensor; at concurrency=1 the scratch
+    holds the whole single-sequence prefill, so this holds. Asserted loudly.
+
+    INVARIANT-1 tripwire: all shared layers alias ONE scratch tensor and write
+    it serially. We tag the scratch (by data_ptr) with the last writer and
+    require its per-layer offload to have completed before the next layer
+    overwrites. Serial synchronous forward (write -> FA read -> offload, all
+    before the next layer's forward starts) makes this hold structurally; the
+    assert catches a future parallel/pipelined executor loudly instead of
+    silently corrupting. Cleared by kvshare_prefill_offload.
+    """
+    n = int(md.num_actual_tokens)
+    slot_mapping = md.slot_mapping[:n]
+    scratch_slots = kv_cache.shape[0] * kv_cache.shape[2]  # num_blocks * bs
+    assert int(slot_mapping.max().item()) < scratch_slots, (
+        "kvshare scratch overflow: prefill slot_mapping exceeds the scratch "
+        "tensor capacity (concurrency>1 or scratch too small). This is a "
+        "temporary-design constraint of footprint_kvshare, not a vLLM invariant."
+    )
+    ptr = kv_cache.data_ptr()
+    prev = _SCRATCH_OWNER.get(ptr)
+    assert prev is None or prev[1], (
+        f"INVARIANT-1 violated: scratch {ptr:#x} written by layer "
+        f"{prev[0] if prev else '?'} whose offload has NOT completed before "
+        f"layer {layer.layer_idx} overwrites it. footprint_kvshare assumes "
+        f"serial layer execution; a parallel/pipelined executor needs a "
+        f"per-layer scratch buffer."
+    )
+    _SCRATCH_OWNER[ptr] = [layer.layer_idx, False]  # [writer, offload_done]
+    impl.do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+    # Remember which scratch this layer wrote, so its offload can mark it done.
+    layer._quest_kvshare_scratch_ptr = ptr
+
+
+def kvshare_prefill_offload(layer, key, value, md) -> None:
+    """Stage 2C-v2: per-layer prefill offload for a SHARED Quest layer, sourced
+    from this layer's key/value (NOT the scratch, which the next layer
+    overwrites). Establishes the bounded working set + summaries at prefill
+    time via TierManager.prefill_ingest_kvshare (keep last cap-1 full blocks,
+    spill the rest, stage the trailing partial as the live block).
+
+    Concurrency=1 scope: one request per prefill. Walks query_start_loc to honor
+    per-request token ranges defensively, but the design targets a single seq.
+    """
+    tm: TierManager | None = getattr(layer, "tier_manager", None)
+    if tm is None:
+        return
+    block_size = tm.gpu_k.shape[1]
+    seq_lens = md.seq_lens.tolist()
+    qstart = md.query_start_loc.tolist()
+    for req_idx, _sl in enumerate(seq_lens):
+        beg = qstart[req_idx]
+        end = qstart[req_idx + 1]
+        prompt_len = end - beg
+        if prompt_len <= 0:
+            continue
+        num_full = prompt_len // block_size
+        seq_id = _seq_id_for(md, req_idx)
+        tm.prefill_ingest_kvshare(
+            seq_id=seq_id,
+            num_full_blocks=num_full,
+            key=key[beg:end],
+            value=value[beg:end],
+            block_size=block_size,
+            prompt_len=prompt_len,
+        )
+    # INVARIANT-1: this layer's offload is done; release the scratch so the next
+    # serially-executed shared layer may overwrite it.
+    ptr = getattr(layer, "_quest_kvshare_scratch_ptr", None)
+    if ptr is not None and ptr in _SCRATCH_OWNER:
+        _SCRATCH_OWNER[ptr][1] = True
+
+
+def kvshare_decode_write(layer, key, value, md) -> None:
+    """Stage 2C-v2: write each decode step's token KV into the per-layer arena
+    live block for a SHARED Quest layer, sourced from key/value (the engine
+    wrote nothing to the scratch under kv-share). Mirrors the GC + active-set
+    bookkeeping of notify_filled_blocks_after_decode but without the
+    scratch-sourced trim/on_block_filled/write_live_block reads.
+
+    Each request contributes exactly one decode token this step. ``seq_lens``
+    here is the length INCLUDING the just-generated token, so the token's
+    logical position is ``sl - 1``.
+    """
+    tm: TierManager | None = getattr(layer, "tier_manager", None)
+    if tm is None:
+        return
+    block_size = tm.gpu_k.shape[1]
+    seq_lens = md.seq_lens.tolist()
+    rids = getattr(md, "request_ids", ()) or ()
+    active = {rids[i] if i < len(rids) else i for i in range(len(seq_lens))}
+    prev_active = getattr(tm, "_active_seqs", None)
+    if prev_active is not None:
+        for old in prev_active - active:
+            tm.free_request(old)
+    tm._active_seqs = active
+    for req_idx, sl in enumerate(seq_lens):
+        seq_id = _seq_id_for(md, req_idx)
+        # The decode token sits at logical position sl-1; seq_len_before = sl-1.
+        tm.append_decode_token_kvshare(
+            seq_id=seq_id,
+            seq_len_before=sl - 1,
+            k_tok=key[req_idx],
+            v_tok=value[req_idx],
+            block_size=block_size,
+        )
 
 
 def _next_quest_layer_idx(layer) -> int | None:
