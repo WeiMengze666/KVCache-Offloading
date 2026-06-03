@@ -29,6 +29,7 @@ from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
 
+from .arkvale import ArkValeConfig
 from .attention import AttentionConfig
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
@@ -340,6 +341,10 @@ class VllmConfig:
     """Configuration for the Quest sparse offload attention backend. None
     disables it (default). Populated by `EngineArgs` when the user sets
     --enable-quest-sparse-offload."""
+    arkvale_config: ArkValeConfig | None = None
+    """Configuration for the ArkVale (cuboid_mean) sparse offload attention
+    backend. None disables it (default). Populated by `EngineArgs` when the
+    user sets --enable-arkvale-sparse-offload."""
     kv_events_config: KVEventsConfig | None = None
     """The configurations for event publishing."""
     ec_transfer_config: ECTransferConfig | None = None

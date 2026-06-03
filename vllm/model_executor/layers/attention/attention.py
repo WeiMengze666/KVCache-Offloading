@@ -653,21 +653,23 @@ class Attention(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Block size may get updated after model loading, refresh it
         block_size = vllm_config.cache_config.block_size
-        # Quest sparse offload: layers handled by Quest backend get a
-        # working-set sized spec unless they are in full_kv_layers (which
-        # always retain a full attention KV).
+        # Quest / ArkVale sparse offload: layers handled by Quest backend
+        # get a working-set sized spec unless they are in full_kv_layers
+        # (which always retain a full attention KV).
         # Lazy import to keep the default path free of quest module loads.
-        quest_cfg = getattr(vllm_config, "quest_config", None)
-        if quest_cfg is not None and quest_cfg.enabled:
+        from vllm.config import get_active_sparse_cfg
+
+        sparse_cfg = get_active_sparse_cfg(vllm_config)
+        if sparse_cfg is not None:
             from vllm.v1.attention.backends.quest.backend import (
                 QuestSparseOffloadBackend,
             )
 
-            is_quest_layer = (
+            is_sparse_layer = (
                 self.attn_backend is QuestSparseOffloadBackend
-                and self.layer_idx not in quest_cfg.full_kv_layers
+                and self.layer_idx not in sparse_cfg.full_kv_layers
             )
-            if is_quest_layer:
+            if is_sparse_layer:
                 from vllm.v1.kv_cache_interface import QuestKVCacheSpec
 
                 return QuestKVCacheSpec(
@@ -675,7 +677,7 @@ class Attention(nn.Module, AttentionLayerBase):
                     num_kv_heads=self.num_kv_heads,
                     head_size=self.head_size,
                     dtype=self.kv_cache_torch_dtype,
-                    gpu_cache_blocks_per_seq=quest_cfg.gpu_cache_blocks_per_seq,
+                    gpu_cache_blocks_per_seq=sparse_cfg.gpu_cache_blocks_per_seq,
                 )
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER

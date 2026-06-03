@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""QuestConfig: configuration for the Quest sparse offload attention backend.
+"""ArkValeConfig: configuration for the ArkVale (cuboid_mean) sparse selector.
 
-Phase A only carries plumbing. Tiering / async / kernel fields are present so
-later phases can flip them without re-introducing config-shape churn — but
-they are validated and have safe defaults that keep Phase A behavior equal to
-FlashAttention with the gate flipped.
+ArkVale shares the entire QuestSparseOffloadBackend, BlockSummaryStore,
+and KV tiering / CPU offload stack with Quest. The only algorithmic
+difference is the page-digest formula, controlled by `digest_mode`
+(default 'arkvale_cuboid_mean'). All other fields mirror QuestConfig.
 """
 
 from __future__ import annotations
@@ -20,27 +20,28 @@ DigestMode = Literal["quest_minmax", "arkvale_cuboid_mean"]
 
 
 @dataclass
-class QuestConfig:
+class ArkValeConfig:
     enabled: bool = False
-    backend_name: str = "QUEST_SPARSE_OFFLOAD"
+    backend_name: str = "ARKVALE_SPARSE_OFFLOAD"
 
-    # Quest algorithm (Phase B activates these).
+    # Algorithm
     block_size: int = 32
     top_k: int = 64
     full_kv_layers: list[int] = field(default_factory=lambda: [0, 1])
-    digest_mode: DigestMode = "quest_minmax"
-    """Page digest formula. 'quest_minmax' = true K amax/amin (Quest, default).
+    digest_mode: DigestMode = "arkvale_cuboid_mean"
+    """Page digest formula. Differs from QuestConfig: defaults to 'arkvale_cuboid_mean'.
+    'quest_minmax' = true K amax/amin (Quest, default).
     'arkvale_cuboid_mean' = center +/- mean(|K - center|) where
     center = (true_max + true_min) / 2 (ArkVale cuboid-mean variant).
 
     The digest tensor layout is identical for both modes — selection ops
     and CPU offload are unaware of which formula produced the values."""
 
-    # GPU/CPU tiering (Phase B activates these).
+    # GPU/CPU tiering
     gpu_cache_blocks_per_seq: int = 256
     cpu_cache_blocks: int = 65536
     cpu_cache_gib: int | None = None
-    """Total pinned CPU pool budget in GiB across ALL Quest layers.
+    """Total pinned CPU pool budget in GiB across ALL ArkVale layers.
 
     When set, the runtime computes `floor(cpu_cache_gib * 1024**3 /
     page_size_bytes / num_quest_layers)` and takes the min with
@@ -52,27 +53,24 @@ class QuestConfig:
     configuration."""
     eviction_policy: EvictionPolicy = "lru"
 
-    # Stage 2B: write-through D2H. When True, every full block is mirrored to a
-    # durable pinned-host slot at fill time (on the d2h_stream); eviction then
-    # just drops the GPU slot (host copy already exists) and a miss is H2D-only.
-    # Requires the host pool to hold every logical block of the sequence — see
-    # resolve_cpu_blocks_per_layer's max_model_len sizing. Opt-in; False keeps
-    # the 2A write-back path byte-for-byte.
+    # Stage 2B: write-through D2H. Mirrors QuestConfig.enable_write_through
+    # so the shared backend treats the two configs as interchangeable. When
+    # True, every full block is mirrored to a durable pinned-host slot at
+    # fill time; eviction then just drops the GPU slot and a miss is H2D-only.
+    # Requires the host pool to hold every logical block of the sequence —
+    # see resolve_cpu_blocks_per_layer's max_model_len sizing. Opt-in;
+    # False keeps the 2A write-back path byte-for-byte.
     enable_write_through: bool = False
 
-    # Stage 2C-v2: footprint reduction via kv-share eviction. When True, the
-    # non-full-KV Quest layers are routed OUT of the HMA KV-cache groups by
-    # pointing each at the first Quest layer ("scratch") via vLLM's kv-sharing
-    # channel (wired at construction time). The engine then reserves blocks only
-    # for the full-KV layers + the one scratch layer, so gpu_memory_utilization
-    # can be lowered → the reserved pool actually shrinks (real footprint drop).
-    # Quest owns the KV write for the shared layers (the engine's auto-write is
-    # skipped under kv-share). Requires prefix caching OFF (shared layers reuse
-    # one physical scratch tensor — prefix-cache reuse would be silent
-    # corruption). Opt-in; False keeps the 2A/2B path byte-for-byte.
+    # Stage 2C-v2: footprint reduction via kv-share. Mirrors
+    # QuestConfig.footprint_kvshare. When True, the non-full-KV ArkVale
+    # layers are routed OUT of the HMA KV-cache groups by pointing each at
+    # the first ArkVale layer ("scratch") via vLLM's kv-sharing channel.
+    # Requires prefix caching OFF. Opt-in; False keeps the 2A/2B path
+    # byte-for-byte.
     footprint_kvshare: bool = False
 
-    # Async (Phase C activates these).
+    # Async (Phase C)
     enable_async_prefetch: bool = False
     """Phase C gate. When True, ensure_resident issues non_blocking=True H2D
     on a dedicated h2d_stream and returns an event for the compute stream
@@ -82,7 +80,7 @@ class QuestConfig:
 
     enable_double_buffering: bool = False
     """Phase C reserved. Currently unused — the Phase C design uses a single
-    h2d/d2h stream pair without staging buffers (each Quest layer has its
+    h2d/d2h stream pair without staging buffers (each ArkVale layer has its
     own GPU pool, so layer-N forward and H2D into layer-N+1 don't conflict).
     Reserved for future expansion."""
 
@@ -107,7 +105,7 @@ class QuestConfig:
        the worst case (zero overlap between speculation and reality),
        Mode 2 can be 2x slower than Mode 1.
 
-       Quest's cross-layer top-k overlap is workload-dependent and has
+       ArkVale's cross-layer top-k overlap is workload-dependent and has
        not been measured for this project. **Do not enable Mode 2
        (prefetch_window_blocks > 0) in production without first
        benchmarking the overlap fraction on your model.** Phase D may
@@ -115,13 +113,13 @@ class QuestConfig:
        at 0.
     """
 
-    # Kernel dispatch (Phase D activates "cuda").
+    # Kernel
     selection_impl: SelectionImpl = "torch"
 
-    # Debug.
+    # Debug
     enable_debug_counters: bool = False
 
-    # Compatibility behavior when the loaded model isn't whitelisted.
+    # Compatibility
     unsupported_model_policy: UnsupportedModelPolicy = "error"
 
     def validate(self) -> None:
@@ -133,22 +131,18 @@ class QuestConfig:
                 f"gpu_cache_blocks_per_seq ({self.gpu_cache_blocks_per_seq})"
             )
         if self.block_size <= 0:
-            raise ValueError(
-                f"block_size must be positive, got {self.block_size}"
-            )
+            raise ValueError(f"block_size must be positive, got {self.block_size}")
         if self.cpu_cache_blocks < 0:
             raise ValueError(
                 f"cpu_cache_blocks must be >= 0, got {self.cpu_cache_blocks}"
             )
         if self.cpu_cache_gib is not None and self.cpu_cache_gib <= 0:
             raise ValueError(
-                f"cpu_cache_gib must be positive when set, "
-                f"got {self.cpu_cache_gib}"
+                f"cpu_cache_gib must be positive when set, got {self.cpu_cache_gib}"
             )
         if self.eviction_policy not in ("lru", "arc"):
             raise ValueError(
-                f"eviction_policy must be 'lru' or 'arc', "
-                f"got {self.eviction_policy!r}"
+                f"eviction_policy must be 'lru' or 'arc', got {self.eviction_policy!r}"
             )
         if self.selection_impl not in ("torch", "triton", "cuda"):
             raise ValueError(
@@ -164,8 +158,7 @@ class QuestConfig:
             isinstance(x, int) for x in self.full_kv_layers
         ):
             raise ValueError(
-                f"full_kv_layers must be a list of int, "
-                f"got {self.full_kv_layers!r}"
+                f"full_kv_layers must be a list of int, got {self.full_kv_layers!r}"
             )
         if self.digest_mode not in ("quest_minmax", "arkvale_cuboid_mean"):
             raise ValueError(
@@ -197,7 +190,7 @@ class QuestConfig:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "QuestConfig":
+    def from_dict(cls, data: dict[str, Any]) -> ArkValeConfig:
         return cls(**data)
 
     def resolve_cpu_blocks_per_layer(
@@ -211,19 +204,16 @@ class QuestConfig:
     ) -> int:
         """Per-layer pinned-host block count.
 
-        The ceiling is the tighter of the legacy `cpu_cache_blocks` and the
-        optional `cpu_cache_gib` byte budget (2A behavior, preserved exactly
-        when the sizing args below are absent).
-
-        Stage 2B: when `max_model_len`, `max_num_seqs`, and `block_size` are all
-        given, the pool must be able to back every logical block of every
-        concurrent sequence under write-through, so it sizes UP to
-        ``need = cdiv(max_model_len, block_size) * max_num_seqs`` — but never
-        above the ceiling. If the ceiling is below `need` AND write-through is
-        enabled, that's unsatisfiable (an evicted block would have no host
-        backup → silent corruption), so raise loudly. With write-through off,
-        the under-provisioned ceiling is tolerated (write-back reloads-and-frees
-        lazily, so it need not hold the whole sequence).
+        Mirrors ``QuestConfig.resolve_cpu_blocks_per_layer`` so the shared
+        backend (``init_runtime_state``) can call either config object with
+        the same kwargs. The ceiling is the tighter of ``cpu_cache_blocks``
+        and the optional ``cpu_cache_gib`` byte budget. When the sizing
+        kwargs are given, the pool sizes UP to ``need = cdiv(max_model_len,
+        block_size) * max_num_seqs`` but never above the ceiling. If the
+        ceiling is below ``need`` AND write-through is enabled, that's
+        unsatisfiable (an evicted block would have no host backup → silent
+        corruption), so raise loudly. With write-through off, the
+        under-provisioned ceiling is tolerated.
         """
         if num_quest_layers <= 0:
             return 0
@@ -232,7 +222,8 @@ class QuestConfig:
             ceiling = legacy_cap
         else:
             gib_cap = (
-                self.cpu_cache_gib * (1024 ** 3) // page_size_bytes
+                self.cpu_cache_gib * (1024**3)
+                // page_size_bytes
                 // num_quest_layers
             )
             ceiling = min(legacy_cap, gib_cap)
@@ -244,8 +235,8 @@ class QuestConfig:
         if need > ceiling:
             if self.enable_write_through:
                 raise RuntimeError(
-                    f"Quest write-through needs the host pool to back the "
-                    f"whole sequence: need {need} blocks/layer "
+                    f"ArkVale write-through needs the host pool to back "
+                    f"the whole sequence: need {need} blocks/layer "
                     f"(cdiv({max_model_len},{block_size}) * {max_num_seqs}) "
                     f"but the configured ceiling is only {ceiling} "
                     f"(cpu_cache_blocks={self.cpu_cache_blocks}, "

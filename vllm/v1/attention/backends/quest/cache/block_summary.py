@@ -1,17 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Per-block summary store (max/min along the sequence axis)."""
+"""Per-block summary store (Quest min/max or ArkVale cuboid-mean digest)."""
+
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
+
+DigestMode = Literal["quest_minmax", "arkvale_cuboid_mean"]
 
 
 class BlockSummaryStore:
     """Holds [num_layers, max_blocks, 2, num_kv_heads, head_size] tensor.
 
-    `summary[L, B, 0]` is `amax_over_block(K)`, `summary[L, B, 1]` is
-    `amin_over_block(K)`. Used by quest_selection as the only visible part
-    of evicted blocks.
+    `summary[L, B, 0]` and `summary[L, B, 1]` are the two digest endpoints
+    used by quest_selection. The formula that fills them depends on
+    `digest_mode`:
+      - 'quest_minmax' (default): slot 0 = K amax, slot 1 = K amin
+      - 'arkvale_cuboid_mean': slot 0 = center + radius_mean,
+                                slot 1 = center - radius_mean,
+        where center = (true_max + true_min)/2 and
+        radius_mean = mean(|K - center|) over the block-token axis.
+
+    Downstream selection ops are agnostic to the formula — they read
+    only the two slot values.
     """
 
     def __init__(
@@ -24,21 +37,29 @@ class BlockSummaryStore:
         head_size: int,
         dtype: torch.dtype,
         device: str | torch.device = "cuda",
+        digest_mode: DigestMode = "quest_minmax",
     ) -> None:
         if num_layers <= 0:
             raise ValueError(f"num_layers must be > 0, got {num_layers}")
         if max_blocks <= 0:
             raise ValueError(f"max_blocks must be > 0, got {max_blocks}")
+        if digest_mode not in ("quest_minmax", "arkvale_cuboid_mean"):
+            raise ValueError(
+                f"digest_mode must be 'quest_minmax' or "
+                f"'arkvale_cuboid_mean', got {digest_mode!r}"
+            )
 
         self.num_layers = num_layers
         self.max_blocks = max_blocks
         self.block_size = block_size
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
+        self.digest_mode: DigestMode = digest_mode
 
         self.summary = torch.zeros(
             (num_layers, max_blocks, 2, num_kv_heads, head_size),
-            dtype=dtype, device=device,
+            dtype=dtype,
+            device=device,
         )
 
     def on_block_filled(
@@ -57,8 +78,16 @@ class BlockSummaryStore:
                 f"k_block shape {tuple(k_block.shape)} != "
                 f"({self.block_size}, {self.num_kv_heads}, {self.head_size})"
             )
-        self.summary[layer_idx, block_id, 0] = k_block.amax(dim=0)
-        self.summary[layer_idx, block_id, 1] = k_block.amin(dim=0)
+        if self.digest_mode == "arkvale_cuboid_mean":
+            k_max = k_block.amax(dim=0)
+            k_min = k_block.amin(dim=0)
+            center = (k_max + k_min) * 0.5
+            radius = (k_block - center).abs().mean(dim=0)
+            self.summary[layer_idx, block_id, 0] = center + radius
+            self.summary[layer_idx, block_id, 1] = center - radius
+        else:  # 'quest_minmax'
+            self.summary[layer_idx, block_id, 0] = k_block.amax(dim=0)
+            self.summary[layer_idx, block_id, 1] = k_block.amin(dim=0)
 
     def gather(
         self,
