@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 EvictionPolicy = Literal["lru", "arc"]
+BlockOrdering = Literal["lru", "prefetch", "mixture"]
 SelectionImpl = Literal["torch", "triton", "cuda"]
 UnsupportedModelPolicy = Literal["error", "fallback"]
 DigestMode = Literal["quest_minmax", "arkvale_cuboid_mean"]
@@ -115,6 +116,15 @@ class QuestConfig:
        at 0.
     """
 
+    # Stage 3 block-ordering axis. `block_ordering` selects the decode-time
+    # residency policy: "lru" (pure recency, = today's behavior), "prefetch"
+    # (resident set driven by the prev layer's selection), or "mixture"
+    # (prev-selected ranked ahead of LRU for eviction). `prefetch_touch`
+    # controls where a speculatively-prefetched block lands in the LRU
+    # (True=MRU/protected, False=LRU-tail); only meaningful under "mixture".
+    block_ordering: BlockOrdering = "lru"
+    prefetch_touch: bool = False
+
     # Kernel dispatch (Phase D activates "cuda").
     selection_impl: SelectionImpl = "torch"
 
@@ -191,6 +201,40 @@ class QuestConfig:
             raise ValueError(
                 f"footprint_kvshare must be a bool, "
                 f"got {self.footprint_kvshare!r}"
+            )
+        if self.block_ordering not in ("lru", "prefetch", "mixture"):
+            raise ValueError(
+                f"block_ordering must be 'lru', 'prefetch', or 'mixture', "
+                f"got {self.block_ordering!r}"
+            )
+        if self.block_ordering in ("prefetch", "mixture"):
+            if not self.enable_async_prefetch:
+                raise ValueError(
+                    f"block_ordering={self.block_ordering!r} requires "
+                    "enable_async_prefetch=True (cross-layer async prefetch "
+                    "needs the stream pool)."
+                )
+            # Effective window: 0 means "unset" -> backfilled to top_k at
+            # runtime. Validate the post-backfill value against the arena.
+            eff_window = self.prefetch_window_blocks or self.top_k
+            if eff_window <= 0:
+                raise ValueError(
+                    "effective prefetch window must be > 0 under "
+                    f"block_ordering={self.block_ordering!r}"
+                )
+            if eff_window >= self.gpu_cache_blocks_per_seq:
+                raise ValueError(
+                    f"effective prefetch window ({eff_window}) must be < "
+                    f"gpu_cache_blocks_per_seq "
+                    f"({self.gpu_cache_blocks_per_seq}): a window >= arena "
+                    "would evict blocks the same prefetch pass brought in."
+                )
+        if self.prefetch_touch and self.block_ordering in ("lru", "prefetch"):
+            raise ValueError(
+                "prefetch_touch=True is meaningless under "
+                f"block_ordering={self.block_ordering!r}; it only applies to "
+                "'mixture'. Set block_ordering='mixture' or "
+                "prefetch_touch=False."
             )
 
     def to_dict(self) -> dict[str, Any]:
