@@ -143,6 +143,23 @@ def _vllm_kv_pool_bytes(worker) -> int | None:
     return int(v) if v else None
 
 
+def _arena_total_bytes(tms: list[Any]) -> int:
+    """Total bytes of all Quest TierManager `gpu_k` + `gpu_v` arenas.
+
+    The Quest arena is allocated via `torch.empty` in
+    vllm/v1/attention/backends/quest/backend.py (Stage 2A+ private buffer,
+    no aliasing). It lives outside `available_kv_cache_memory_bytes` and
+    must be subtracted from `torch.allocated_bytes` to get a clean
+    weights+workspace `essential` figure. K and V are equally sized, so
+    we use `gpu_k.numel() * element_size() * 2`.
+    """
+    total = 0
+    for tm in tms:
+        k = tm.gpu_k
+        total += int(k.numel()) * int(k.element_size()) * 2
+    return total
+
+
 def _dense_kv_useful_bytes(worker, bytes_per_block: int | None) -> int | None:
     if bytes_per_block is None:
         return None

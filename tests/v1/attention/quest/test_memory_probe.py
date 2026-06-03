@@ -222,7 +222,17 @@ class FakeStats:
 
 
 class FakeTM:
-    def __init__(self, layer_idx, gpu_resident, cpu_resident):
+    def __init__(
+        self,
+        layer_idx,
+        gpu_resident,
+        cpu_resident,
+        arena_cap=16,
+        block_size=256,
+        h_kv=4,
+        head_dim=64,
+        dtype_bytes=2,
+    ):
         self.layer_idx = layer_idx
         self._gpu_resident = gpu_resident
         self._cpu_resident = cpu_resident
@@ -230,6 +240,20 @@ class FakeTM:
         _n = gpu_resident
         self._slot_map = type("M", (), {"size": lambda self, _n=_n: _n})()
         self._cpu_slots = {i: i for i in range(cpu_resident)}
+
+        class _GpuK:
+            def __init__(self, cap, bs, h, d, dbytes):
+                self.shape = (cap, bs, h, d)
+                self._numel = cap * bs * h * d
+                self._dbytes = dbytes
+
+            def numel(self):
+                return self._numel
+
+            def element_size(self):
+                return self._dbytes
+
+        self.gpu_k = _GpuK(arena_cap, block_size, h_kv, head_dim, dtype_bytes)
 
     def stats(self):
         return self._stats
@@ -320,6 +344,21 @@ class TestProbeSnapshot:
         assert snap["quest.gpu_resident_blocks"] is None
         assert snap["quest.topk_hit_ratio"] is None
         assert snap["vllm.gpu_kv_useful_bytes"] is None
+
+    def test_arena_total_sums_across_quest_layers(self):
+        from benchmarks.quest_memory_probe import probes
+
+        # Two Quest layers, identical arena geometry.
+        # cap=16, block_size=256, h_kv=4, head_dim=64, fp16 (2 bytes).
+        # per-layer K bytes = 16*256*4*64*2 = 2_097_152
+        # K+V → ×2; two layers → ×2 again.
+        tms = [FakeTM(0, 5, 0), FakeTM(1, 5, 0)]
+        assert probes._arena_total_bytes(tms) == 2 * 2 * 2_097_152
+
+    def test_arena_total_empty_returns_zero(self):
+        from benchmarks.quest_memory_probe import probes
+
+        assert probes._arena_total_bytes([]) == 0
 
 
 class TestSampler:
