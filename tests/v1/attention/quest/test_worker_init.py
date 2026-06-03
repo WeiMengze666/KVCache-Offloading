@@ -87,8 +87,10 @@ def test_init_runtime_state_shares_summary_store(cuda):
 
 
 def test_init_runtime_state_uses_provided_kv_caches(cuda):
-    """When kv_caches is supplied, no fresh GPU allocation happens; the
-    TierManager points at slices of the provided tensor."""
+    """When kv_caches is supplied, the Quest layer gets a PRIVATE bounded arena
+    of gpu_cache_blocks_per_seq blocks (Stage 2A) — NOT a zero-copy view of the
+    full engine tensor. The engine tensor is retained on the TierManager as
+    engine_kv_cache, the source for the prefill->decode trim."""
     from vllm.config.quest import QuestConfig
     from vllm.v1.attention.backends.quest.backend import (
         QuestSparseOffloadBackend,
@@ -126,11 +128,15 @@ def test_init_runtime_state_uses_provided_kv_caches(cuda):
     )
 
     tm = layers[2].tier_manager
-    # gpu_k / gpu_v point INTO the supplied tensor (zero-copy view).
-    assert tm.gpu_k.data_ptr() == fake_kv["layer.2"][:, 0].data_ptr()
-    assert tm.gpu_v.data_ptr() == fake_kv["layer.2"][:, 1].data_ptr()
-    # And the LRU capacity matches the supplied tensor's slot count.
-    assert tm._slot_map.capacity == num_blocks
+    # Stage 2A: gpu_k / gpu_v are a PRIVATE arena, NOT a view of the engine
+    # tensor; the engine tensor is kept as the trim source (engine_kv_cache).
+    assert tm.gpu_k.data_ptr() != fake_kv["layer.2"][:, 0].data_ptr()
+    assert tm.gpu_v.data_ptr() != fake_kv["layer.2"][:, 1].data_ptr()
+    assert tm.engine_kv_cache is fake_kv["layer.2"]
+    # The arena is bounded by gpu_cache_blocks_per_seq, not the engine slot count.
+    assert tm.gpu_budget == quest_cfg.gpu_cache_blocks_per_seq
+    assert tm.gpu_k.shape[0] == quest_cfg.gpu_cache_blocks_per_seq
+    assert tm._slot_map.capacity == quest_cfg.gpu_cache_blocks_per_seq
 
 
 def test_init_runtime_state_without_kv_caches_keeps_phase_b_behavior(cuda):

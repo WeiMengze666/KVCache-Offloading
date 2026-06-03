@@ -26,6 +26,7 @@ def test_quest_metadata_extra_fields():
     assert "sparse_block_table" in fields
     assert "quest_layer_indices" in fields
     assert "is_full_kv_layer" in fields
+    assert "quest_top_k" in fields
 
 
 def test_quest_metadata_builder_passthrough(monkeypatch):
@@ -69,3 +70,40 @@ def test_quest_metadata_builder_passthrough(monkeypatch):
     assert md.sparse_block_table is None  # populated by impl pre-attn
     assert md.is_full_kv_layer.tolist() == [True, True, False, False, False]
     assert md.quest_layer_indices.tolist() == [-1, -1, 0, 1, 2]
+
+
+def test_quest_metadata_builder_propagates_top_k():
+    """Regression: QuestConfig.top_k must reach the decode metadata. Before
+    this was wired, run_sparse_decode fell back to getattr(md,'quest_top_k',64)
+    and effectively selected min(64, full_blocks) == ALL blocks, overflowing the
+    bounded arena (KeyError on gather). set_quest_top_k must propagate into the
+    built metadata's quest_top_k field."""
+    from vllm.v1.attention.backends.quest.metadata import (
+        QuestMetadataBuilder, QuestAttentionMetadata,
+    )
+
+    class _FakeFA:
+        def build(self, *a, **k):
+            from vllm.v1.attention.backends.flash_attn import (
+                FlashAttentionMetadata,
+            )
+            return FlashAttentionMetadata(
+                num_actual_tokens=1, max_query_len=1,
+                query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+                max_seq_len=4, seq_lens=torch.tensor([4], dtype=torch.int32),
+                block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+                slot_mapping=torch.tensor([0], dtype=torch.int64),
+                use_cascade=False, common_prefix_len=0,
+                cu_prefix_query_lens=None, prefix_kv_lens=None,
+                suffix_kv_lens=None,
+            )
+
+    builder = QuestMetadataBuilder.__new__(QuestMetadataBuilder)
+    builder._fa_builder = _FakeFA()
+    builder._quest_layer_indices = torch.tensor([0], dtype=torch.int32)
+    # default (no set_quest_top_k) is the documented fallback
+    assert builder.build_for_test().quest_top_k == 64
+    builder.set_quest_top_k(6)
+    md = builder.build_for_test()
+    assert isinstance(md, QuestAttentionMetadata)
+    assert md.quest_top_k == 6

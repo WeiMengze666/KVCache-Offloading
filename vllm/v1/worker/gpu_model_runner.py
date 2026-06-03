@@ -2397,6 +2397,26 @@ class GPUModelRunner(
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
+        # Quest: stash the current batch's stable request ids on each
+        # QuestMetadataBuilder so the per-forward attn_metadata carries them.
+        # impl_helpers uses these as the seq_id key for the TierManager LRU
+        # arena; without this, two consecutive single-request generates both
+        # see seq_id=0 and the second reads the first's arena content.
+        from vllm.config import get_active_sparse_cfg
+
+        sparse_cfg_local = get_active_sparse_cfg(self.vllm_config)
+        if sparse_cfg_local is not None and not for_cudagraph_capture:
+            from vllm.v1.attention.backends.quest.metadata import (
+                QuestMetadataBuilder,
+            )
+
+            req_ids_snapshot = tuple(self.input_batch.req_ids[:num_reqs])
+            for kv_groups in self.attn_groups:
+                for group in kv_groups:
+                    for builder in group.metadata_builders:
+                        if isinstance(builder, QuestMetadataBuilder):
+                            builder.set_request_ids(req_ids_snapshot)
+
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
@@ -7191,8 +7211,10 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
 
-        quest_config = getattr(self.vllm_config, "quest_config", None)
-        if quest_config is not None and quest_config.enabled:
+        from vllm.config import get_active_sparse_cfg
+
+        sparse_cfg = get_active_sparse_cfg(self.vllm_config)
+        if sparse_cfg is not None:
             from vllm.v1.attention.backends.quest.backend import (
                 QuestSparseOffloadBackend,
             )
@@ -7209,7 +7231,7 @@ class GPUModelRunner(
             # Wire quest_layer_indices into every QuestMetadataBuilder.
             # Without this, _is_full_kv_layer falls back to "True" for
             # every layer and Quest sparse selection never runs.
-            full_set = set(quest_config.full_kv_layers)
+            full_set = set(sparse_cfg.full_kv_layers)
             layers_dict = self.compilation_config.static_forward_context
             sorted_names = sorted(
                 layers_dict.keys(),
@@ -7233,6 +7255,7 @@ class GPUModelRunner(
                     for builder in group.metadata_builders:
                         if isinstance(builder, QuestMetadataBuilder):
                             builder.set_quest_layer_indices(quest_layer_indices)
+                            builder.set_quest_top_k(sparse_cfg.top_k)
 
         if (
             self.speculative_config

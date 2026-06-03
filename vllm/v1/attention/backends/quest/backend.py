@@ -46,6 +46,14 @@ class QuestSparseOffloadBackend(AttentionBackend):
        reclamation events.
     """
 
+    # vLLM's "KV write is a separate op" contract: when False, the engine
+    # (Attention.forward -> unified_kv_cache_update -> impl.do_kv_cache_update)
+    # performs the KV cache write BEFORE impl.forward runs, on every path.
+    # Mirror FlashAttentionBackend (flash_attn.py:96), whose forward no longer
+    # writes KV. We delegate the write to FlashAttentionImpl.do_kv_cache_update
+    # via QuestSparseOffloadImpl.do_kv_cache_update.
+    forward_includes_kv_cache_update: bool = False
+
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
         torch.bfloat16,
@@ -150,11 +158,30 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 "block_size % 256 == 0. Set --block-size 256 or larger."
             )
 
-        if quest_config.top_k > quest_config.gpu_cache_blocks_per_seq:
+        # Stage 2C-v2 (Task A3): under footprint_kvshare the non-full-KV Quest
+        # layers are aliased to ONE physical scratch tensor (kv-share). Prefix
+        # caching would let vLLM's block manager reuse those blocks behind the
+        # TierManager's back → silent corruption. This is a TEMPORARY constraint
+        # of the kv-share-eviction design, NOT a vLLM invariant; guard it loudly
+        # so a future change (or a user flag) fails instead of corrupting.
+        if getattr(quest_config, "footprint_kvshare", False) and getattr(
+            cache_config, "enable_prefix_caching", False
+        ):
             errors.append(
-                f"top_k ({quest_config.top_k}) > gpu_cache_blocks_per_seq "
-                f"({quest_config.gpu_cache_blocks_per_seq}); the working set "
-                "must fit the selected blocks."
+                "footprint_kvshare requires prefix caching to be OFF "
+                "(enable_prefix_caching=False). The shared Quest layers reuse "
+                "one physical scratch tensor, so prefix-cache reuse of those "
+                "blocks is silent corruption. This is a TEMPORARY constraint of "
+                "the kv-share-eviction design, not a vLLM invariant. Pass "
+                "--no-enable-prefix-caching."
+            )
+
+        if quest_config.top_k > quest_config.gpu_cache_blocks_per_seq - 1:
+            errors.append(
+                f"top_k ({quest_config.top_k}) must be <= "
+                f"gpu_cache_blocks_per_seq - 1 "
+                f"({quest_config.gpu_cache_blocks_per_seq - 1}); one arena slot "
+                "is reserved for the live decode block."
             )
 
         compat = check_model_compat(model_config)
@@ -178,6 +205,8 @@ class QuestSparseOffloadBackend(AttentionBackend):
         dtype: torch.dtype,
         quest_config,
         kv_caches: dict[str, torch.Tensor] | None = None,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
     ) -> None:
         """Construct the shared BlockSummaryStore + CpuKvBackingStore + per-
         layer TierManager objects, attach a `tier_manager` attribute to each
@@ -223,6 +252,9 @@ class QuestSparseOffloadBackend(AttentionBackend):
         cpu_blocks = quest_config.resolve_cpu_blocks_per_layer(
             page_size_bytes=page_bytes,
             num_quest_layers=num_quest,
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            block_size=block_size,
         )
 
         summary = BlockSummaryStore(
@@ -233,6 +265,7 @@ class QuestSparseOffloadBackend(AttentionBackend):
             head_size=head_size,
             dtype=dtype,
             device="cuda",
+            digest_mode=quest_config.digest_mode,
         )
         cpu_store = CpuKvBackingStore(
             num_layers=num_quest,
@@ -263,11 +296,24 @@ class QuestSparseOffloadBackend(AttentionBackend):
             layer_name = getattr(layer, "layer_name", None)
             if kv_caches is not None and layer_name in kv_caches:
                 full = kv_caches[layer_name]
-                # FA layout: (num_blocks, 2, block_size, num_kv_heads, head_size)
-                # Zero-copy slice views into the vLLM-allocated tensor.
-                gpu_k = full[:, 0]
-                gpu_v = full[:, 1]
-                gpu_budget = full.shape[0]
+                # Stage 2A: do NOT alias the full engine cache. Allocate a private
+                # bounded arena of gpu_cache_blocks_per_seq blocks; the engine
+                # tensor is kept ONLY as the SOURCE for the prefill->decode trim
+                # (TierManager.trim_to_working_set, added in a later task).
+                # FA layout: full.shape = (num_blocks, 2, block_size, num_kv_heads, head_size)
+                cap = quest_config.gpu_cache_blocks_per_seq
+                gpu_k = torch.empty(
+                    cap,
+                    full.shape[2],
+                    full.shape[3],
+                    full.shape[4],
+                    dtype=full.dtype,
+                    device=full.device,
+                )
+                gpu_v = torch.empty_like(gpu_k)
+                gpu_budget = cap
+                pool_aliases_kv_cache = False
+                engine_kv_for_layer = full
             else:
                 if kv_caches is not None:
                     logger.warning(
@@ -290,6 +336,10 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 )
                 gpu_v = torch.empty_like(gpu_k)
                 gpu_budget = quest_config.gpu_cache_blocks_per_seq
+                # Private buffer: on_block_filled copies KV in and the decode
+                # read path reads via logical_to_slot (unit-test path).
+                pool_aliases_kv_cache = False
+                engine_kv_for_layer = None
             layer.tier_manager = TierManager(
                 layer_idx=slot,
                 gpu_budget=gpu_budget,
@@ -299,8 +349,17 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 residency=residency,
                 cpu_store=cpu_store,
                 stream_pool=stream_pool,
+                enable_event_timing=quest_config.enable_debug_counters,
+                enable_overlap_capture=quest_config.enable_debug_counters,
+                gpu_pool_aliases_kv_cache=pool_aliases_kv_cache,
+                engine_kv_cache=engine_kv_for_layer,
+                enable_write_through=quest_config.enable_write_through,
             )
             layer._quest_selection_callable_ref = selection_callable
+            # Stash the config on every quest layer so impl.forward can read
+            # footprint_kvshare (Stage 2C-v2) without a global lookup. (Mode 2
+            # also sets this below for the registry path; harmless to set here.)
+            layer._quest_config_ref = quest_config
 
         # Mode 2 layer-registry: only when async is on AND prefetch window
         # is non-zero. Without these refs, run_sparse_decode's helpers
@@ -335,7 +394,9 @@ class QuestSparseOffloadBackend(AttentionBackend):
         5. Call init_runtime_state with the kv_caches dict so each
            TierManager points into the vLLM-allocated tensor.
         """
-        quest_config = getattr(vllm_config, "quest_config", None)
+        from vllm.config import get_active_sparse_cfg
+
+        quest_config = get_active_sparse_cfg(vllm_config)
         if quest_config is None or not quest_config.enabled:
             return
 
@@ -361,6 +422,16 @@ class QuestSparseOffloadBackend(AttentionBackend):
 
         sample = quest_layers_list[0]
         block_size = vllm_config.cache_config.block_size
+        # Stage 2B Q1: host-pool sizing needs the longest sequence and the
+        # concurrency so write-through can back every logical block.
+        max_model_len = getattr(
+            vllm_config.model_config, "max_model_len", None
+        )
+        max_num_seqs = getattr(
+            getattr(vllm_config, "scheduler_config", None),
+            "max_num_seqs",
+            None,
+        )
 
         cls.init_runtime_state(
             layers=quest_layers_list,
@@ -371,4 +442,6 @@ class QuestSparseOffloadBackend(AttentionBackend):
             dtype=sample.kv_cache_torch_dtype,
             quest_config=quest_config,
             kv_caches=kv_caches,
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
         )

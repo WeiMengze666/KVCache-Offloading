@@ -7,6 +7,7 @@ later phases can flip them without re-introducing config-shape churn — but
 they are validated and have safe defaults that keep Phase A behavior equal to
 FlashAttention with the gate flipped.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -15,6 +16,7 @@ from typing import Any, Literal
 EvictionPolicy = Literal["lru", "arc"]
 SelectionImpl = Literal["torch", "triton", "cuda"]
 UnsupportedModelPolicy = Literal["error", "fallback"]
+DigestMode = Literal["quest_minmax", "arkvale_cuboid_mean"]
 
 
 @dataclass
@@ -26,6 +28,13 @@ class QuestConfig:
     block_size: int = 32
     top_k: int = 64
     full_kv_layers: list[int] = field(default_factory=lambda: [0, 1])
+    digest_mode: DigestMode = "quest_minmax"
+    """Page digest formula. 'quest_minmax' = true K amax/amin (Quest, default).
+    'arkvale_cuboid_mean' = center +/- mean(|K - center|) where
+    center = (true_max + true_min) / 2 (ArkVale cuboid-mean variant).
+
+    The digest tensor layout is identical for both modes — selection ops
+    and CPU offload are unaware of which formula produced the values."""
 
     # GPU/CPU tiering (Phase B activates these).
     gpu_cache_blocks_per_seq: int = 256
@@ -42,6 +51,26 @@ class QuestConfig:
     is kept for backwards compatibility with the Transformers-side
     configuration."""
     eviction_policy: EvictionPolicy = "lru"
+
+    # Stage 2B: write-through D2H. When True, every full block is mirrored to a
+    # durable pinned-host slot at fill time (on the d2h_stream); eviction then
+    # just drops the GPU slot (host copy already exists) and a miss is H2D-only.
+    # Requires the host pool to hold every logical block of the sequence — see
+    # resolve_cpu_blocks_per_layer's max_model_len sizing. Opt-in; False keeps
+    # the 2A write-back path byte-for-byte.
+    enable_write_through: bool = False
+
+    # Stage 2C-v2: footprint reduction via kv-share eviction. When True, the
+    # non-full-KV Quest layers are routed OUT of the HMA KV-cache groups by
+    # pointing each at the first Quest layer ("scratch") via vLLM's kv-sharing
+    # channel (wired at construction time). The engine then reserves blocks only
+    # for the full-KV layers + the one scratch layer, so gpu_memory_utilization
+    # can be lowered → the reserved pool actually shrinks (real footprint drop).
+    # Quest owns the KV write for the shared layers (the engine's auto-write is
+    # skipped under kv-share). Requires prefix caching OFF (shared layers reuse
+    # one physical scratch tensor — prefix-cache reuse would be silent
+    # corruption). Opt-in; False keeps the 2A/2B path byte-for-byte.
+    footprint_kvshare: bool = False
 
     # Async (Phase C activates these).
     enable_async_prefetch: bool = False
@@ -138,6 +167,11 @@ class QuestConfig:
                 f"full_kv_layers must be a list of int, "
                 f"got {self.full_kv_layers!r}"
             )
+        if self.digest_mode not in ("quest_minmax", "arkvale_cuboid_mean"):
+            raise ValueError(
+                f"digest_mode must be 'quest_minmax' or "
+                f"'arkvale_cuboid_mean', got {self.digest_mode!r}"
+            )
         if self.prefetch_window_blocks < 0:
             raise ValueError(
                 f"prefetch_window_blocks must be >= 0, "
@@ -148,6 +182,16 @@ class QuestConfig:
                 "prefetch_window_blocks > 0 (Mode 2) requires "
                 "enable_async_prefetch=True (Mode 1)."
             )
+        if not isinstance(self.enable_write_through, bool):
+            raise ValueError(
+                f"enable_write_through must be a bool, "
+                f"got {self.enable_write_through!r}"
+            )
+        if not isinstance(self.footprint_kvshare, bool):
+            raise ValueError(
+                f"footprint_kvshare must be a bool, "
+                f"got {self.footprint_kvshare!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -157,15 +201,56 @@ class QuestConfig:
         return cls(**data)
 
     def resolve_cpu_blocks_per_layer(
-        self, *, page_size_bytes: int, num_quest_layers: int,
+        self,
+        *,
+        page_size_bytes: int,
+        num_quest_layers: int,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
+        block_size: int | None = None,
     ) -> int:
+        """Per-layer pinned-host block count.
+
+        The ceiling is the tighter of the legacy `cpu_cache_blocks` and the
+        optional `cpu_cache_gib` byte budget (2A behavior, preserved exactly
+        when the sizing args below are absent).
+
+        Stage 2B: when `max_model_len`, `max_num_seqs`, and `block_size` are all
+        given, the pool must be able to back every logical block of every
+        concurrent sequence under write-through, so it sizes UP to
+        ``need = cdiv(max_model_len, block_size) * max_num_seqs`` — but never
+        above the ceiling. If the ceiling is below `need` AND write-through is
+        enabled, that's unsatisfiable (an evicted block would have no host
+        backup → silent corruption), so raise loudly. With write-through off,
+        the under-provisioned ceiling is tolerated (write-back reloads-and-frees
+        lazily, so it need not hold the whole sequence).
+        """
         if num_quest_layers <= 0:
             return 0
         legacy_cap = self.cpu_cache_blocks
         if self.cpu_cache_gib is None:
-            return legacy_cap
-        gib_cap = (
-            self.cpu_cache_gib * (1024 ** 3) // page_size_bytes
-            // num_quest_layers
-        )
-        return min(legacy_cap, gib_cap)
+            ceiling = legacy_cap
+        else:
+            gib_cap = (
+                self.cpu_cache_gib * (1024 ** 3) // page_size_bytes
+                // num_quest_layers
+            )
+            ceiling = min(legacy_cap, gib_cap)
+
+        if max_model_len is None or max_num_seqs is None or block_size is None:
+            return ceiling
+
+        need = -(-max_model_len // block_size) * max_num_seqs  # cdiv * seqs
+        if need > ceiling:
+            if self.enable_write_through:
+                raise RuntimeError(
+                    f"Quest write-through needs the host pool to back the "
+                    f"whole sequence: need {need} blocks/layer "
+                    f"(cdiv({max_model_len},{block_size}) * {max_num_seqs}) "
+                    f"but the configured ceiling is only {ceiling} "
+                    f"(cpu_cache_blocks={self.cpu_cache_blocks}, "
+                    f"cpu_cache_gib={self.cpu_cache_gib}). Raise the ceiling "
+                    f"or lower max_model_len/max_num_seqs."
+                )
+            return ceiling
+        return need

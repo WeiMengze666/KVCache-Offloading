@@ -39,20 +39,22 @@ is set. The test sets it via monkeypatch so the worker accepts the probe.
 The flag is scoped to the test process (and propagated to children via env
 inheritance at fork) and reset on teardown.
 
-Current status: xfail (R-E1-4)
-------------------------------
-At the time of writing, ``enable_quest_sparse_offload=True`` does *not*
-flip ``AttentionConfig.backend`` to ``AttentionBackendEnum.CUSTOM``. The v1
-selector therefore picks ``FlashAttentionBackend`` for every layer, and
-``QuestSparseOffloadBackend.bind_runtime`` filters those layers out (they
-fail ``layer.attn_backend is cls``). No layer ever receives a TierManager
-and the assertions below trip. This is R-E1-4 in the design doc.
+Current status: PASSING (R-E1-4 resolved)
+-----------------------------------------
+This test was once ``xfail(strict=False)`` for R-E1-4: at that time
+``enable_quest_sparse_offload=True`` did *not* flip ``AttentionConfig.backend``
+to ``AttentionBackendEnum.CUSTOM``, so the v1 selector picked
+``FlashAttentionBackend`` for every layer, ``bind_runtime`` filtered them all
+out (they failed ``layer.attn_backend is cls``), no layer received a
+TierManager, and the assertions below tripped.
 
-The test is committed as ``xfail(strict=False)`` so it surfaces the gap in
-every e2e run without blocking the suite. When integration is fixed
-(``enable_quest_sparse_offload`` should auto-set ``attention_config.backend``
-to ``CUSTOM`` *and* propagate ``use_sparse=True`` so ``validate_configuration``
-accepts), this test will XPASS and the marker can be removed.
+That integration is now fixed: ``enable_quest_sparse_offload`` auto-sets the
+attention backend to ``CUSTOM`` (engine log shows ``Using
+AttentionBackendEnum.CUSTOM backend``) and propagates ``use_sparse`` so
+``validate_configuration`` accepts. The xfail marker has been removed and the
+test is a **hard pass** — verified 2026-06-02 on Llama-3.2-3B
+(``HF_HUB_OFFLINE=1``): TierManagers attach and ``select_calls`` /
+``selected_total`` / ``selected_on_gpu`` are all > 0.
 """
 
 from __future__ import annotations
@@ -179,4 +181,26 @@ def test_quest_mixed_prefill_decode_engages_sparse_path(
     assert total_h2d >= 0, (
         f"load_h2d={total_h2d} went negative across "
         f"{len(layer_stats)} Quest layer(s) — counter corruption."
+    )
+
+    # Stage 0 Item 2: the selected_on_gpu hit-rate counter must be wired up.
+    # With gpu_cache_blocks_per_seq=512 and ~600-token prompts (~3 blocks of
+    # 256) nothing is ever evicted, so every selected block is resident and
+    # selected_on_gpu should equal selected_total. The invariant
+    # 0 <= selected_on_gpu <= selected_total must always hold; and because
+    # selection ran on resident blocks, selected_on_gpu must be > 0 (populated,
+    # not stuck at the never-incremented default).
+    total_on_gpu = sum(
+        s["stats"]["selected_on_gpu"] for s in layer_stats if s["stats"]
+    )
+    assert 0 <= total_on_gpu <= total_selected, (
+        f"selected_on_gpu={total_on_gpu} outside [0, "
+        f"selected_total={total_selected}] across {len(layer_stats)} "
+        f"Quest layer(s) — counter corruption or measured after "
+        f"ensure_resident."
+    )
+    assert total_on_gpu > 0, (
+        f"selected_on_gpu=0 across {len(layer_stats)} Quest layer(s) despite "
+        f"selected_total={total_selected} on a no-eviction run — the "
+        f"selected_on_gpu counter is not being incremented (Stage 0 Item 2)."
     )

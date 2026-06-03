@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""QuestKVCacheSpec sizes itself by the working set, not by max_model_len."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""QuestKVCacheSpec reports a working-set budget for feasibility checks.
+
+Def-2: max_memory_usage_bytes is a feasibility/concurrency metric, NOT a
+physical-allocation directive (the reserved GPU pool stays global). These tests
+verify the arithmetic of that metric; they do not imply a smaller reserved peak.
+"""
+
 from __future__ import annotations
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +25,7 @@ def _vllm_config(max_model_len: int = 32768):
     )
 
 
-def test_quest_spec_max_memory_uses_working_set_not_full_seq():
+def test_quest_spec_max_memory_reports_working_set_not_full_seq():
     from vllm.v1.kv_cache_interface import QuestKVCacheSpec
 
     spec = QuestKVCacheSpec(
@@ -68,7 +74,11 @@ def test_quest_spec_copy_with_new_block_size_preserves_budget():
 
 
 def test_quest_spec_savings_vs_full_attention():
-    """Sanity: 70% memory cut at gpu_budget=32 for a 32k context model."""
+    """Sanity: at gpu_budget=32 for a 32k-context model the Quest per-layer
+    feasibility METRIC is >=70% smaller than FullAttentionSpec's. This is a
+    feasibility/concurrency number (a working-set metric), NOT a footprint /
+    reserved-pool cut — the physical reserved GPU pool stays global either way.
+    See CLAUDE.md "显存术语" for the footprint / resident-set / working-set model."""
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         QuestKVCacheSpec,
@@ -92,7 +102,7 @@ def test_quest_spec_savings_vs_full_attention():
     full_bytes = full.max_memory_usage_bytes(cfg)
     quest_bytes = quest.max_memory_usage_bytes(cfg)
     assert quest_bytes < full_bytes
-    assert quest_bytes / full_bytes < 0.30  # at least 70% saved per layer
+    assert quest_bytes / full_bytes < 0.30  # >=70% smaller feasibility metric
 
 
 def test_quest_spec_validates_positive_budget():
@@ -117,7 +127,6 @@ def test_attention_returns_quest_spec_for_quest_layer():
         QuestSparseOffloadBackend,
     )
     from vllm.v1.kv_cache_interface import (
-        FullAttentionSpec,
         QuestKVCacheSpec,
     )
 
@@ -250,3 +259,104 @@ def test_quest_spec_is_attention_spec_for_worker_dispatch():
         gpu_cache_blocks_per_seq=32,
     )
     assert isinstance(spec, AttentionSpec)
+
+
+# ---------------------------------------------------------------------------
+# ArkVale mirrors: get_kv_cache_spec routes ArkVale layers via QuestKVCacheSpec
+# ---------------------------------------------------------------------------
+
+
+def test_attention_returns_quest_spec_for_arkvale_layer():
+    """ArkVale layer (not in full_kv_layers) returns QuestKVCacheSpec via
+    get_active_sparse_cfg — mirrors the Quest equivalent."""
+    from unittest.mock import MagicMock
+
+    from vllm.config.arkvale import ArkValeConfig
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+    from vllm.v1.kv_cache_interface import (
+        QuestKVCacheSpec,
+    )
+
+    layer = MagicMock()
+    layer.attn_backend = QuestSparseOffloadBackend
+    layer.attn_type = "decoder"
+    layer.sliding_window = None
+    layer.kv_cache_dtype = "auto"
+    layer.kv_cache_torch_dtype = torch.bfloat16
+    layer.num_kv_heads = 8
+    layer.head_size = 128
+    layer.head_size_v = 128
+    layer.layer_idx = 5  # not in full_kv_layers
+
+    arkvale_cfg = ArkValeConfig(
+        enabled=True,
+        gpu_cache_blocks_per_seq=64,
+        full_kv_layers=[0, 1],
+    )
+    vllm_cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=256),
+        arkvale_config=arkvale_cfg,
+        quest_config=None,
+        model_config=SimpleNamespace(max_model_len=32768),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
+
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    spec = Attention.get_kv_cache_spec(layer, vllm_cfg)
+    assert isinstance(spec, QuestKVCacheSpec)
+    assert spec.gpu_cache_blocks_per_seq == 64
+    assert spec.block_size == 256
+
+
+def test_attention_returns_full_spec_for_arkvale_full_kv_layer():
+    """ArkVale layer_idx in full_kv_layers falls through to FullAttentionSpec —
+    mirrors test_attention_returns_full_spec_for_full_kv_layer."""
+    from unittest.mock import MagicMock
+
+    from vllm.config.arkvale import ArkValeConfig
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        QuestKVCacheSpec,
+    )
+
+    layer = MagicMock()
+    layer.attn_backend = QuestSparseOffloadBackend
+    layer.attn_type = "decoder"
+    layer.sliding_window = None
+    layer.kv_cache_dtype = "auto"
+    layer.kv_cache_torch_dtype = torch.bfloat16
+    layer.num_kv_heads = 8
+    layer.head_size = 128
+    layer.head_size_v = 128
+    layer.layer_idx = 0  # in full_kv_layers
+
+    arkvale_cfg = ArkValeConfig(
+        enabled=True,
+        gpu_cache_blocks_per_seq=64,
+        full_kv_layers=[0, 1],
+    )
+    vllm_cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=256),
+        arkvale_config=arkvale_cfg,
+        quest_config=None,
+        model_config=SimpleNamespace(max_model_len=32768),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
+
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    spec = Attention.get_kv_cache_spec(layer, vllm_cfg)
+    assert isinstance(spec, FullAttentionSpec)
+    assert not isinstance(spec, QuestKVCacheSpec)

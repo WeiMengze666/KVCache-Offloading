@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for QuestConfig dataclass."""
+
 from __future__ import annotations
 
 import pytest
@@ -79,9 +81,71 @@ def test_quest_config_to_dict_round_trip():
     assert restored == original
 
 
+def test_quest_config_write_through_roundtrip():
+    """Stage 2B: enable_write_through defaults False and survives to_dict /
+    from_dict so a JSON --quest-config can flip it on."""
+    from vllm.config.quest import QuestConfig
+
+    default = QuestConfig()
+    assert default.enable_write_through is False
+    assert default.to_dict()["enable_write_through"] is False
+
+    on = QuestConfig(enabled=True, enable_write_through=True)
+    d = on.to_dict()
+    assert d["enable_write_through"] is True
+    restored = QuestConfig.from_dict(d)
+    assert restored.enable_write_through is True
+    assert restored == on
+
+
+def test_quest_config_write_through_validates_bool():
+    """validate() rejects a non-bool enable_write_through (config-time guard)."""
+    from vllm.config.quest import QuestConfig
+
+    with pytest.raises(ValueError, match="enable_write_through"):
+        QuestConfig(enabled=True, enable_write_through="yes").validate()
+
+
+def test_quest_stats_has_evict_drop():
+    """Write-through evictions only drop the GPU slot (host backup exists);
+    they count as evict_drop, distinct from write-back's evict_d2h."""
+    from vllm.v1.attention.backends.quest.cache.stats import QuestStats
+
+    s = QuestStats()
+    assert s.evict_drop == 0
+    s.evict_drop += 1
+    assert s.evict_drop == 1
+
+
+def test_quest_config_footprint_kvshare_roundtrip():
+    """Stage 2C-v2: footprint_kvshare defaults False and survives to_dict /
+    from_dict so a JSON --quest-config can flip it on."""
+    from vllm.config.quest import QuestConfig
+
+    default = QuestConfig()
+    assert default.footprint_kvshare is False
+    assert default.to_dict()["footprint_kvshare"] is False
+
+    on = QuestConfig(enabled=True, footprint_kvshare=True)
+    d = on.to_dict()
+    assert d["footprint_kvshare"] is True
+    restored = QuestConfig.from_dict(d)
+    assert restored.footprint_kvshare is True
+    assert restored == on
+
+
+def test_quest_config_footprint_kvshare_validates_bool():
+    """validate() rejects a non-bool footprint_kvshare (config-time guard)."""
+    from vllm.config.quest import QuestConfig
+
+    with pytest.raises(ValueError, match="footprint_kvshare"):
+        QuestConfig(enabled=True, footprint_kvshare="yes").validate()
+
+
 def test_vllm_config_has_quest_config_field_default_none():
-    from vllm.config import VllmConfig
     import dataclasses
+
+    from vllm.config import VllmConfig
 
     fields = {f.name for f in dataclasses.fields(VllmConfig)}
     assert "quest_config" in fields, (
@@ -145,7 +209,8 @@ def test_resolve_cpu_pool_blocks_legacy_only():
 
     cfg = QuestConfig(cpu_cache_blocks=128, cpu_cache_gib=None)
     blocks_per_layer = cfg.resolve_cpu_blocks_per_layer(
-        page_size_bytes=1024 * 1024, num_quest_layers=30,
+        page_size_bytes=1024 * 1024,
+        num_quest_layers=30,
     )
     assert blocks_per_layer == 128
 
@@ -154,9 +219,75 @@ def test_resolve_cpu_pool_zero_quest_layers_returns_zero():
     from vllm.config.quest import QuestConfig
 
     cfg = QuestConfig()
+    assert (
+        cfg.resolve_cpu_blocks_per_layer(
+            page_size_bytes=1024 * 1024,
+            num_quest_layers=0,
+        )
+        == 0
+    )
+
+
+def test_resolve_cpu_blocks_uses_max_model_len():
+    """Stage 2B Q1: when max_model_len/max_num_seqs/block_size are given, the
+    host pool sizes UP to hold every logical block of every concurrent seq:
+    need = cdiv(max_model_len, block_size) * max_num_seqs, capped by the
+    legacy/gib ceiling. Write-through needs this to back the whole sequence."""
+    from vllm.config.quest import QuestConfig
+
+    # need = cdiv(4096, 256) * 4 = 16 * 4 = 64; legacy ceiling 65536 is looser.
+    cfg = QuestConfig(cpu_cache_blocks=65536)
+    blocks_per_layer = cfg.resolve_cpu_blocks_per_layer(
+        page_size_bytes=1024 * 1024,
+        num_quest_layers=30,
+        max_model_len=4096,
+        max_num_seqs=4,
+        block_size=256,
+    )
+    assert blocks_per_layer == 64
+
+
+def test_resolve_cpu_blocks_capped_below_need_raises_when_write_through():
+    """If the ceiling is below `need` AND write-through is on, the host pool
+    can't back the whole sequence → loud RuntimeError, not silent corruption."""
+    from vllm.config.quest import QuestConfig
+
+    # need = cdiv(4096, 256) * 4 = 64, but legacy ceiling is only 16.
+    cfg = QuestConfig(cpu_cache_blocks=16, enable_write_through=True)
+    with pytest.raises(RuntimeError, match="host pool"):
+        cfg.resolve_cpu_blocks_per_layer(
+            page_size_bytes=1024 * 1024,
+            num_quest_layers=30,
+            max_model_len=4096,
+            max_num_seqs=4,
+            block_size=256,
+        )
+
+
+def test_resolve_cpu_blocks_capped_below_need_ok_without_write_through():
+    """Same under-provisioned ceiling is tolerated (clamped) when write-through
+    is off — write-back reloads lazily and frees, so the pool need not hold all."""
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(cpu_cache_blocks=16, enable_write_through=False)
+    blocks_per_layer = cfg.resolve_cpu_blocks_per_layer(
+        page_size_bytes=1024 * 1024,
+        num_quest_layers=30,
+        max_model_len=4096,
+        max_num_seqs=4,
+        block_size=256,
+    )
+    assert blocks_per_layer == 16  # clamped to the ceiling, no raise
+
+
+def test_resolve_cpu_blocks_legacy_path_unchanged_when_args_absent():
+    """All-None new args ⇒ exact 2A behavior (existing callers unaffected)."""
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(cpu_cache_blocks=128, cpu_cache_gib=None)
     assert cfg.resolve_cpu_blocks_per_layer(
-        page_size_bytes=1024 * 1024, num_quest_layers=0,
-    ) == 0
+        page_size_bytes=1024 * 1024, num_quest_layers=30,
+    ) == 128
 
 
 def test_prefetch_window_requires_async_enabled():
@@ -164,22 +295,54 @@ def test_prefetch_window_requires_async_enabled():
     from vllm.config.quest import QuestConfig
 
     # Async + window > 0: ok (Mode 2).
-    QuestConfig(enabled=True, enable_async_prefetch=True,
-                prefetch_window_blocks=4).validate()
+    QuestConfig(
+        enabled=True, enable_async_prefetch=True, prefetch_window_blocks=4
+    ).validate()
 
     # Async + window 0: ok (Mode 1).
-    QuestConfig(enabled=True, enable_async_prefetch=True,
-                prefetch_window_blocks=0).validate()
+    QuestConfig(
+        enabled=True, enable_async_prefetch=True, prefetch_window_blocks=0
+    ).validate()
 
     # Sync + window > 0: rejected.
     with pytest.raises(ValueError, match="enable_async_prefetch"):
-        QuestConfig(enabled=True, enable_async_prefetch=False,
-                    prefetch_window_blocks=4).validate()
+        QuestConfig(
+            enabled=True, enable_async_prefetch=False, prefetch_window_blocks=4
+        ).validate()
 
 
 def test_prefetch_window_negative_rejected():
     from vllm.config.quest import QuestConfig
 
     with pytest.raises(ValueError, match="prefetch_window_blocks"):
-        QuestConfig(enabled=True,
-                    prefetch_window_blocks=-1).validate()
+        QuestConfig(enabled=True, prefetch_window_blocks=-1).validate()
+
+
+def test_quest_config_digest_mode_default():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig()
+    assert cfg.digest_mode == "quest_minmax"
+
+
+def test_quest_config_digest_mode_arkvale_value_accepted():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(digest_mode="arkvale_cuboid_mean")
+    cfg.validate()  # should not raise
+
+
+def test_quest_config_digest_mode_invalid_rejected():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(digest_mode="bogus")
+    with pytest.raises(ValueError, match="digest_mode"):
+        cfg.validate()
+
+
+def test_quest_config_digest_mode_round_trip():
+    from vllm.config.quest import QuestConfig
+
+    cfg = QuestConfig(digest_mode="arkvale_cuboid_mean")
+    cfg2 = QuestConfig.from_dict(cfg.to_dict())
+    assert cfg2.digest_mode == "arkvale_cuboid_mean"

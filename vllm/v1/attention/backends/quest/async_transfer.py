@@ -8,6 +8,17 @@ Quest layers in the engine, plus a Mode 2 prefetch event registry.
 Construction is gated on `quest_config.enable_async_prefetch`; when
 disabled the backend doesn't import this module and TierManager runs
 the Phase B sync path.
+
+Stage 2A note (no compute/transfer overlap yet): with the bounded arena now
+real (was no-op'd under the removed aliasing), these async paths actually move
+data and are correct (sync == async; see
+test_async_ensure_resident_matches_sync_on_arena). But they are NOT overlapped
+with compute in 2A — H2D sits on the decode critical path
+(select -> miss -> H2D -> wait_event -> compute, serial per layer), and D2H
+spill fires only at eviction. Real overlap requires Stage 2B write-through
+(mirror each block to host on the d2h_stream at fill time, so a miss needs only
+H2D) plus Stage 3 prefetch ordering (issue the next layer's H2D before it
+selects). Do not read 2A timing numbers as if transfers were hidden.
 """
 from __future__ import annotations
 
