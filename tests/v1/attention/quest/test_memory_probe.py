@@ -1087,6 +1087,18 @@ class TestE2ESmoke:
             assert (tmp_path / name / "summary.json").exists()
             assert (tmp_path / name / "samples.csv").exists()
 
+            import json
+
+            summary = json.loads((tmp_path / name / "summary.json").read_text())
+            for s in summary["samples"]:
+                # actual_used_bytes is essential + arena (Quest mode);
+                # peak counter (口径 B) must be ≥ window-max (口径 A).
+                assert s["peak_actual_used_bytes"] > 0, s
+                assert (
+                    s["peak_actual_used_peak_bytes"] >= s["peak_actual_used_bytes"]
+                ), s
+                assert s["peak_engine_essential_peak_bytes"] > 0, s
+
         plots = tmp_path / "plots"
         assert (plots / "memory_peak_bar.png").exists()
         assert (plots / "kv_pool_breakdown.png").exists()
