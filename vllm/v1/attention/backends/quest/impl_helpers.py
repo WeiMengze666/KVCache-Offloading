@@ -227,6 +227,14 @@ def kvshare_prefill_offload(layer, key, value, md) -> None:
 
     Concurrency=1 scope: one request per prefill. Walks query_start_loc to honor
     per-request token ranges defensively, but the design targets a single seq.
+
+    Cross-request GC: ``prefill_ingest_kvshare`` mutates the LRU slot map,
+    ``_cpu_slots``/``_host_slots``, and per-(layer, block) residency. The 2A
+    path's GC (mirror in ``notify_filled_blocks_after_decode``) is too late
+    here — request B's prefill runs BEFORE any decode step, so any state left
+    over from request A would either crash ``begin_evict`` (residency still
+    ``ON_CPU``) or trip the "must not overflow the arena" guard (LRU still
+    full). Diff ``_active_seqs`` and free finished requests up front.
     """
     tm: TierManager | None = getattr(layer, "tier_manager", None)
     if tm is None:
@@ -234,6 +242,13 @@ def kvshare_prefill_offload(layer, key, value, md) -> None:
     block_size = tm.gpu_k.shape[1]
     seq_lens = md.seq_lens.tolist()
     qstart = md.query_start_loc.tolist()
+    rids = getattr(md, "request_ids", ()) or ()
+    active = {rids[i] if i < len(rids) else i for i in range(len(seq_lens))}
+    prev_active = getattr(tm, "_active_seqs", None)
+    if prev_active is not None:
+        for old in prev_active - active:
+            tm.free_request(old)
+    tm._active_seqs = active
     for req_idx, _sl in enumerate(seq_lens):
         beg = qstart[req_idx]
         end = qstart[req_idx + 1]
