@@ -116,6 +116,8 @@ class TierManager:
         gpu_pool_aliases_kv_cache: bool = False,
         engine_kv_cache: torch.Tensor | None = None,
         enable_write_through: bool = False,
+        block_ordering: str = "lru",
+        prefetch_touch: bool = False,
     ) -> None:
         self.layer_idx = layer_idx
         self.gpu_budget = gpu_budget
@@ -173,6 +175,13 @@ class TierManager:
         # when write-through is off.
         self.enable_write_through = enable_write_through
         self._host_slots: dict[tuple[int, int], int] = {}
+        # Stage 3 block-ordering. Under "mixture", set_prev_selected records the
+        # previous layer's selection per seq; _protected_keys turns it into the
+        # protected set fed to _LRUSlotMap.add so eviction skips prev-selected
+        # blocks. "lru"/"prefetch" never populate _prev_selected (zero overhead).
+        self.block_ordering = block_ordering
+        self.prefetch_touch = prefetch_touch
+        self._prev_selected: dict[int, set[int]] = {}
         self._stats = QuestStats()
         # Debug-only per-(step, seq) selected block-id log (overlap capture).
         self._selected_log: list[dict] = []
@@ -240,6 +249,27 @@ class TierManager:
         return sum(
             1 for bid in logical_block_ids if (seq_id, int(bid)) in self._slot_map
         )
+
+    def set_prev_selected(self, seq_id: int, block_ids) -> None:
+        """Record the previous layer's selected block ids for `seq_id`.
+
+        Only stored under block_ordering="mixture" (the only policy whose
+        eviction consults it). A no-op for lru/prefetch keeps _prev_selected
+        empty and the path zero-overhead.
+        """
+        if self.block_ordering != "mixture":
+            return
+        self._prev_selected[seq_id] = {int(b) for b in block_ids}
+
+    def _protected_keys(self, seq_id: int) -> set:
+        """Protected (seq_id, block_id) keys for eviction under mixture.
+
+        Empty for lru/prefetch (no protection); under mixture it is the
+        prev-layer selection mapped into slot-map key space.
+        """
+        if self.block_ordering != "mixture":
+            return set()
+        return {(seq_id, b) for b in self._prev_selected.get(seq_id, ())}
 
     def register_prefill_summary(
         self,
@@ -599,6 +629,7 @@ class TierManager:
             evicted_blocks.append(k[1])
         # 3. trimmed marker.
         self._trimmed.discard(seq_id)
+        self._prev_selected.pop(seq_id, None)
         # 4. Residency rows. Use mark_on_gpu (the legal write to this layer's
         # state machine) rather than poking _states directly. Idempotent.
         for b in evicted_blocks:
