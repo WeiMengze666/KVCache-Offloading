@@ -64,16 +64,32 @@ class _LRUSlotMap:
         self._key_to_slot.move_to_end(key)
         return slot
 
-    def add(self, key) -> tuple[int, tuple[int, int] | None]:
-        """Add a new key, returning (slot, evicted_key_or_None)."""
+    def add(self, key, protected=None) -> tuple[int, tuple[int, int] | None]:
+        """Add a new key, returning (slot, evicted_key_or_None).
+
+        When the map is full and `protected` is given (a set of keys), the
+        eviction victim is the LRU-tail key NOT in `protected`; only if every
+        resident key is protected does it fall back to the protected LRU tail.
+        protected=None (the default) reproduces pure-LRU eviction byte-for-byte.
+        """
         if key in self._key_to_slot:
             return self.get(key), None
         evicted = None
         if self._free_slots:
             slot = self._free_slots.pop()
-        else:
+        elif not protected:
             evicted_key, slot = self._key_to_slot.popitem(last=False)
             evicted = evicted_key
+        else:
+            # LRU order = insertion/access order; first non-protected is the
+            # oldest evictable. Fall back to the absolute LRU tail if all
+            # resident keys are protected.
+            victim = next(
+                (k for k in self._key_to_slot if k not in protected),
+                next(iter(self._key_to_slot)),
+            )
+            slot = self._key_to_slot.pop(victim)
+            evicted = victim
         self._key_to_slot[key] = slot
         return slot, evicted
 
