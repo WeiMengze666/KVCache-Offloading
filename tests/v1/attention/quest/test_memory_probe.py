@@ -721,6 +721,36 @@ class TestSummary:
         assert len(out) == 1
         assert out[0]["peak_nvml_used_bytes"] == 100
 
+    def test_aggregate_peak_actual_used_and_arena(self):
+        from benchmarks.quest_memory_probe.summary import aggregate_samples
+
+        rows = [
+            {"phase": "sample_start", "sample_id": "s0", "prompt_tokens": 10},
+            {
+                "phase": "sampling",
+                "vllm.actual_used_bytes": 100,
+                "vllm.actual_used_peak_bytes": 150,
+                "vllm.engine_essential_peak_bytes": 80,
+            },
+            {
+                "phase": "sampling",
+                "vllm.actual_used_bytes": 300,
+                "vllm.actual_used_peak_bytes": 350,
+                "vllm.engine_essential_peak_bytes": 200,
+            },
+            {
+                "phase": "sample_end",
+                "sample_id": "s0",
+                "gen_tokens": 5,
+                "latency_s": 0.1,
+            },
+        ]
+        out = aggregate_samples(rows)
+        assert len(out) == 1
+        assert out[0]["peak_actual_used_bytes"] == 300
+        assert out[0]["peak_actual_used_peak_bytes"] == 350
+        assert out[0]["peak_engine_essential_peak_bytes"] == 200
+
 
 class TestRunnerHelpers:
     def test_make_quest_engine_kwargs_dense(self):

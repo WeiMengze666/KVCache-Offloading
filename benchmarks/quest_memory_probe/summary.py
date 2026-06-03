@@ -23,6 +23,9 @@ _PEAK_FIELDS = (
     ("peak_torch_allocated_bytes", "torch.allocated_bytes"),
     ("peak_torch_reserved_bytes", "torch.reserved_bytes"),
     ("peak_kv_useful_bytes", "vllm.gpu_kv_useful_bytes"),
+    ("peak_actual_used_bytes", "vllm.actual_used_bytes"),
+    ("peak_actual_used_peak_bytes", "vllm.actual_used_peak_bytes"),
+    ("peak_engine_essential_peak_bytes", "vllm.engine_essential_peak_bytes"),
 )
 _MEDIAN_FIELDS = (
     ("mean_kv_slack_bytes", "vllm.kv_pool_slack_bytes"),
