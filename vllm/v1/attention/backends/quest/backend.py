@@ -354,8 +354,11 @@ class QuestSparseOffloadBackend(AttentionBackend):
                 gpu_pool_aliases_kv_cache=pool_aliases_kv_cache,
                 engine_kv_cache=engine_kv_for_layer,
                 enable_write_through=quest_config.enable_write_through,
-                block_ordering=quest_config.block_ordering,
-                prefetch_touch=quest_config.prefetch_touch,
+                # Stage 3 fields live only on QuestConfig; sibling configs
+                # (e.g. ArkValeConfig) reuse this path and never set them, so
+                # default to the byte-identical lru/False behavior via getattr.
+                block_ordering=getattr(quest_config, "block_ordering", "lru"),
+                prefetch_touch=getattr(quest_config, "prefetch_touch", False),
             )
             layer._quest_selection_callable_ref = selection_callable
             # Stash the config on every quest layer so impl.forward can read
@@ -369,7 +372,10 @@ class QuestSparseOffloadBackend(AttentionBackend):
         # Stage 3: the cross-layer registry is needed for any non-lru ordering
         # (prefetch/mixture), not only the legacy window>0 trigger. lru never
         # needs cross-layer refs.
-        if stream_pool is not None and quest_config.block_ordering != "lru":
+        if (
+            stream_pool is not None
+            and getattr(quest_config, "block_ordering", "lru") != "lru"
+        ):
             tm_registry: dict[int, TierManager] = {
                 l.layer_idx: l.tier_manager for l in quest_layers
             }
