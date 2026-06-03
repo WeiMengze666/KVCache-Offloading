@@ -298,6 +298,7 @@ def test_bind_runtime_attaches_quest_refs_to_layers(cuda):
         cpu_cache_blocks=4,
         enable_async_prefetch=True,
         prefetch_window_blocks=2,
+        block_ordering="prefetch",
     )
     Q = QuestSparseOffloadBackend
     layers_dict = {
@@ -584,3 +585,41 @@ def test_init_runtime_state_propagates_digest_mode_arkvale():
     )
     summary_store = layer.tier_manager.summary_store
     assert summary_store.digest_mode == "arkvale_cuboid_mean"
+
+
+def test_bind_runtime_builds_registry_for_mixture_zero_window(cuda):
+    """block_ordering='mixture' must build the cross-layer registry even when
+    prefetch_window_blocks is left at 0 (runtime backfills it to top_k)."""
+    from vllm.config.quest import QuestConfig
+    from vllm.v1.attention.backends.quest.backend import (
+        QuestSparseOffloadBackend,
+    )
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    quest_cfg = QuestConfig(
+        enabled=True, full_kv_layers=[0], gpu_cache_blocks_per_seq=4,
+        top_k=3, cpu_cache_blocks=4, enable_async_prefetch=True,
+        block_ordering="mixture", prefetch_window_blocks=0,
+    )
+    Q = QuestSparseOffloadBackend
+    layers_dict = {
+        "layer.0": _layer(0, "layer.0"),
+        "layer.1": _layer(1, "layer.1", attn_backend=Q),
+        "layer.2": _layer(2, "layer.2", attn_backend=Q),
+    }
+    fake_kv = {
+        f"layer.{i}": torch.empty(
+            (8, 2, 256, 2, 64), dtype=torch.float16, device="cuda"
+        )
+        for i in (1, 2)
+    }
+    QuestSparseOffloadBackend.bind_runtime(
+        vllm_config=_vllm_config(quest_cfg),
+        kv_cache_config=KVCacheConfig(
+            num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[],
+        ),
+        kv_caches=fake_kv, layers=layers_dict,
+    )
+    reg = layers_dict["layer.1"]._quest_layer_tm_registry
+    assert reg[2] is layers_dict["layer.2"].tier_manager
+    assert layers_dict["layer.1"].tier_manager.block_ordering == "mixture"

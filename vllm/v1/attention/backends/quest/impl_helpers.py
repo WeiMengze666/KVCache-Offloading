@@ -320,13 +320,16 @@ def _next_quest_layer_idx(layer) -> int | None:
     return after[0] if after else None
 
 
-def _prefetch_window(layer) -> int:
-    """Read prefetch_window_blocks off the layer's quest_config (cached
-    by bind_runtime). Returns 0 when not set or when Mode 2 is disabled."""
+def _prefetch_window(layer, top_k: int) -> int:
+    """Effective prefetch window: min(configured, top_k), with 0 meaning
+    'unset' -> backfill to top_k. Returns 0 only under lru (no prefetch)."""
     qc = getattr(layer, "_quest_config_ref", None)
     if qc is None:
         return 0
-    return int(getattr(qc, "prefetch_window_blocks", 0))
+    if getattr(qc, "block_ordering", "lru") == "lru":
+        return 0
+    configured = int(getattr(qc, "prefetch_window_blocks", 0)) or top_k
+    return min(configured, top_k)
 
 
 def _quest_layer_tier_manager(layer, target_layer_idx: int):
@@ -529,16 +532,24 @@ def run_sparse_decode(impl, layer, query, kv_cache, md, output) -> torch.Tensor:
     if pool is not None:
         next_layer_idx = _next_quest_layer_idx(layer)
         if next_layer_idx is not None:
-            window = _prefetch_window(layer)
+            window = _prefetch_window(layer, top_k)
             if window > 0:
                 next_tm = _quest_layer_tier_manager(layer, next_layer_idx)
                 if next_tm is not None:
                     for req_idx, top_ids in enumerate(per_req_top_ids):
-                        # Limit how many ids we prefetch to bound the
-                        # LRU-thrash exposure (see QuestConfig docstring).
+                        seq_id = _seq_id_for(md, req_idx)
                         ids = top_ids[:window]
+                        # mixture: record this layer's selection so the next
+                        # layer's eviction protects it. No-op under prefetch
+                        # (set_prev_selected only stores under mixture).
+                        next_tm.set_prev_selected(
+                            seq_id=seq_id,
+                            block_ids=ids.tolist(),
+                        )
+                        # Limit prefetch count to bound LRU-thrash exposure
+                        # (see QuestConfig.prefetch_window_blocks docstring).
                         next_tm.prefetch_top_ids(
-                            seq_id=_seq_id_for(md, req_idx),
+                            seq_id=seq_id,
                             logical_block_ids=ids,
                         )
 
