@@ -103,7 +103,9 @@ def execute(cfg: RunConfig, out_dir: Path) -> None:
 
     try:
         cfg.validate()
-        samples = load_samples(cfg.workload_spec, model=cfg.model)
+        samples = load_samples(
+            cfg.workload_spec, model=cfg.model, longbench_full=cfg.longbench_full
+        )
         # OOM-sweep configs walk samples in ascending prompt length.
         if cfg.name.endswith("_oom"):
             samples = sorted(samples, key=lambda s: s.prompt_tokens)

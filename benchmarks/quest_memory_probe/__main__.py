@@ -77,6 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="max generated tokens per sample",
     )
     common.add_argument("--gpu-mem-util", type=float, default=0.55)
+    common.add_argument(
+        "--longbench-full",
+        action="store_true",
+        help="ignore --samples' n= cap and run every LongBench item that "
+        "buckets into a requested length. Synthetic fallback ignores it.",
+    )
 
     a = sub.add_parser("compare-dense-vs-quest", parents=[common])
     a.add_argument("--quest-pool", type=int, required=True)
@@ -106,6 +112,7 @@ def _apply_common(cfgs: list[RunConfig], args) -> list[RunConfig]:
                     "probe_interval_ms": args.probe_interval_ms,
                     "gpu_memory_utilization": args.gpu_mem_util,
                     "max_tokens": args.max_tokens,
+                    "longbench_full": args.longbench_full,
                 }
             )
         )

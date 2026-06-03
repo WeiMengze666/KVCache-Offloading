@@ -199,18 +199,22 @@ def load_samples(
     spec_str: str,
     *,
     model: str = "meta-llama/Llama-3.2-3B-Instruct",
+    longbench_full: bool = False,
 ) -> list[Sample]:
     """Top-level entry. Tries LongBench, falls back to synthetic.
 
     QUEST_MEM_PROBE_FORCE_SYNTHETIC=1 in the env forces the fallback path
     (handy for unit tests and for cluster runs without HF Hub access).
+
+    longbench_full=True ignores the spec's `n=` cap and takes every item that
+    falls into a requested bucket. Synthetic fallback ignores the flag.
     """
     spec = parse_spec(spec_str)
     if os.environ.get("QUEST_MEM_PROBE_FORCE_SYNTHETIC") == "1":
         print("[quest_memory_probe] forced synthetic workload", file=sys.stderr)
         return load_samples_synthetic(buckets=spec.buckets, n=spec.n)
     try:
-        return _load_samples_longbench(spec, model=model)
+        return _load_samples_longbench(spec, model=model, longbench_full=longbench_full)
     except Exception as e:
         print(
             f"[quest_memory_probe] WARN LongBench load failed ({e!r}); "
@@ -224,6 +228,7 @@ def _load_samples_longbench(
     spec: WorkloadSpec,
     *,
     model: str,
+    longbench_full: bool = False,
 ) -> list[Sample]:
     template = _read_template("0shot.txt")
     ds = _load_dataset("THUDM/LongBench-v2", split="train")
@@ -236,7 +241,7 @@ def _load_samples_longbench(
     # Render + tokenize. We do NOT keep all items in memory — bucket as we go.
     by_bucket: dict[str, list[Sample]] = {b: [] for b in spec.buckets}
     for idx, item in enumerate(items):
-        if all(len(v) >= spec.n for v in by_bucket.values()):
+        if not longbench_full and all(len(v) >= spec.n for v in by_bucket.values()):
             break
         prompt = _build_longbench_prompt(item, template)
         tokens = _tokenize_count(prompt, model=model)
@@ -244,7 +249,9 @@ def _load_samples_longbench(
             bucket = bucket_for_tokens(tokens)
         except ValueError:
             continue
-        if bucket not in by_bucket or len(by_bucket[bucket]) >= spec.n:
+        if bucket not in by_bucket:
+            continue
+        if not longbench_full and len(by_bucket[bucket]) >= spec.n:
             continue
         by_bucket[bucket].append(
             Sample(
@@ -257,7 +264,7 @@ def _load_samples_longbench(
 
     out: list[Sample] = []
     for bucket in spec.buckets:
-        if len(by_bucket[bucket]) < spec.n:
+        if not longbench_full and len(by_bucket[bucket]) < spec.n:
             raise RuntimeError(
                 f"LongBench produced only {len(by_bucket[bucket])}/{spec.n} "
                 f"samples for bucket={bucket!r} (task={spec.task!r}); "

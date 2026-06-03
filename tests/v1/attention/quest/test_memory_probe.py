@@ -207,6 +207,39 @@ class TestLongBenchLoader:
         assert len(samples) == 1
         assert samples[0].sample_id.startswith("synthetic/")
 
+    def test_longbench_full_ignores_n_cap(self, monkeypatch):
+        from benchmarks.quest_memory_probe import workload
+
+        # Fake LongBench dataset: 5 narrativeqa items, all in the 'short'
+        # bucket once tokenized. With n=1 we'd normally only keep 1; with
+        # longbench_full=True we should get all 5.
+        items = [
+            {
+                "domain": "narrativeqa",
+                "context": f"ctx-{i}",
+                "question": "q",
+                "choice_A": "a",
+                "choice_B": "b",
+                "choice_C": "c",
+                "choice_D": "d",
+            }
+            for i in range(5)
+        ]
+        monkeypatch.setattr(workload, "_load_dataset", lambda *a, **k: items)
+        monkeypatch.setattr(workload, "_read_template", lambda _: "$DOC$")
+        # Tokenize: 100 tokens → short bucket regardless of input.
+        monkeypatch.setattr(workload, "_tokenize_count", lambda prompt, model: 100)
+
+        capped = workload.load_samples("longbench:narrativeqa:lengths=short:n=1")
+        assert len(capped) == 1
+
+        full = workload.load_samples(
+            "longbench:narrativeqa:lengths=short:n=1",
+            longbench_full=True,
+        )
+        assert len(full) == 5
+        assert all(s.bucket == "short" for s in full)
+
 
 class FakeStats:
     block_filled = 1

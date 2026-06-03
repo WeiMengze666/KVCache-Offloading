@@ -25,6 +25,9 @@ class RunConfig:
     # Workload
     workload_spec: str = "longbench:narrativeqa:lengths=short:n=1"
     max_tokens: int = 64
+    # When True, the LongBench loader ignores `n=` and takes every item that
+    # falls into a requested bucket. Synthetic fallback ignores this flag.
+    longbench_full: bool = False
     # Quest
     quest_enabled: bool = False
     top_k: int = 0
