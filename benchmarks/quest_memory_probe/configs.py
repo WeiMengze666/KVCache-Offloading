@@ -7,6 +7,7 @@ Pure-Python, no GPU/vLLM imports. Allows unit tests without a CUDA environment.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -33,7 +34,7 @@ class RunConfig:
     top_k: int = 0
     gpu_cache_blocks_per_seq: int = 0
     cpu_cache_blocks: int = 8192
-    cpu_cache_gib: float = 8.0
+    cpu_cache_gib: float = 24.0
     selection_impl: str = "torch"
     full_kv_layers: tuple[int, ...] = field(default_factory=tuple)
     # Probe
@@ -54,10 +55,12 @@ class RunConfig:
                 "gpu_cache_blocks_per_seq must be > 0 when quest_enabled=True"
             )
         if self.gpu_cache_blocks_per_seq % self.top_k != 0:
-            raise ValueError(
+            warnings.warn(
                 f"gpu_cache_blocks_per_seq ({self.gpu_cache_blocks_per_seq}) "
-                f"must be a multiple of top_k ({self.top_k}) so each decode "
-                "step's selected set fits in the GPU pool."
+                f"is not a multiple of top_k ({self.top_k}); the working-set "
+                "won't tile the GPU pool cleanly, so probe curves between "
+                "integer-multiple points may be hard to interpret.",
+                stacklevel=2,
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -109,9 +112,10 @@ def expand_pool_size(
 ) -> list[RunConfig]:
     """Subcommand B: same Quest config, sweep gpu_cache_blocks_per_seq.
 
-    Each pool_size must be a multiple of top_k (Quest invariant: every decode
-    step's selected set must fit in the GPU pool). Validation runs in
-    RunConfig.validate(); we just construct + validate here.
+    Each pool_size that isn't a multiple of top_k will trigger a warning
+    (the working-set no longer tiles the GPU pool cleanly), but is still
+    accepted. Validation runs in RunConfig.validate(); we just construct +
+    validate here.
     """
     out: list[RunConfig] = []
     for p in pool_sizes:

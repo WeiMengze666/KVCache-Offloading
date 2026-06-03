@@ -78,6 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument("--gpu-mem-util", type=float, default=0.55)
     common.add_argument(
+        "--max-model-len",
+        type=int,
+        default=65536,
+        help="vLLM max_model_len. If larger than the model's native "
+        "max_position_embeddings, runner injects hf_overrides to extend it. "
+        "Set to fit the longest prompt you intend to feed.",
+    )
+    common.add_argument(
         "--longbench-full",
         action="store_true",
         help="ignore --samples' n= cap and run every LongBench item that "
@@ -112,6 +120,7 @@ def _apply_common(cfgs: list[RunConfig], args) -> list[RunConfig]:
                     "probe_interval_ms": args.probe_interval_ms,
                     "gpu_memory_utilization": args.gpu_mem_util,
                     "max_tokens": args.max_tokens,
+                    "max_model_len": args.max_model_len,
                     "longbench_full": args.longbench_full,
                 }
             )

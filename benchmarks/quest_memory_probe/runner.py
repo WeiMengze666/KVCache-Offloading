@@ -48,7 +48,14 @@ def _make_engine_kwargs(
     """Common shared kwargs for vllm.LLM(...). Returns a dict that can be
     splatted into the LLM constructor. The Quest config json is written
     elsewhere (kept outside this helper so it can be unit-tested without
-    disk access)."""
+    disk access).
+
+    If cfg.max_model_len exceeds the model's native max_position_embeddings,
+    hf_overrides is injected so vLLM doesn't refuse on context overflow.
+    Llama-3.2 ships with 131072; LongBench-v2 long bucket starts at ~167k
+    tokens, so users running long-bucket samples must raise max_model_len
+    past that boundary.
+    """
     base: dict[str, Any] = dict(
         model=cfg.model,
         dtype=cfg.dtype,
@@ -60,6 +67,12 @@ def _make_engine_kwargs(
         block_size=cfg.block_size,
         seed=cfg.seed,
     )
+    # 131072 is the native max_position for Llama-3.2 (the model this probe
+    # targets per docs/run/probe-memory.md). Hard-coding the threshold avoids
+    # an AutoConfig disk load in tests; users running a different base model
+    # with a smaller native context can extend this check.
+    if cfg.max_model_len > 131072:
+        base["hf_overrides"] = {"max_position_embeddings": cfg.max_model_len}
     if cfg.quest_enabled and quest_json_path is not None:
         base["enable_quest_sparse_offload"] = True
         base["quest_config"] = quest_json_path
@@ -96,6 +109,16 @@ def execute(cfg: RunConfig, out_dir: Path) -> None:
     log_f = (cfg_dir / "stdout.log").open("w", encoding="utf-8")
     sys.stdout = log_f  # type: ignore[assignment]
     sys.stderr = log_f  # type: ignore[assignment]
+    # dup2 the underlying fds 1/2 onto log_f so the vLLM EngineCore subprocess
+    # (which inherits these fds, not Python's sys.stdout/sys.stderr objects)
+    # also writes its OOM tracebacks and ZMQ logs into the same file. Without
+    # this, EngineCore deaths surface as "EngineDeadError: see stack trace
+    # above" with no actual stack trace anywhere in our captured output.
+    try:
+        os.dup2(log_f.fileno(), 1)
+        os.dup2(log_f.fileno(), 2)
+    except OSError as e:
+        print(f"[runner] dup2 failed (will rely on Python-level redirect): {e!r}")
 
     # vLLM v1 IPC: collective_rpc requires this opt-in to ship a Python
     # callable to engine-core.

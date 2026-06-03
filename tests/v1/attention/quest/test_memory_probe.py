@@ -28,7 +28,7 @@ class TestRunConfig:
             top_k=16,
             gpu_cache_blocks_per_seq=100,  # 100 % 16 != 0
         )
-        with pytest.raises(ValueError, match="must be a multiple of top_k"):
+        with pytest.warns(UserWarning, match="not a multiple of top_k"):
             cfg.validate()
 
     def test_valid_quest_config_passes(self):
@@ -95,7 +95,7 @@ class TestConfigExpansion:
             c.validate()
 
     def test_pool_size_rejects_non_multiple(self):
-        with pytest.raises(ValueError, match="multiple of top_k"):
+        with pytest.warns(UserWarning, match="not a multiple of top_k"):
             expand_pool_size(
                 workload_spec="x",
                 top_k=16,
@@ -269,6 +269,64 @@ class TestLongBenchLoader:
         assert len(full) == 5
         assert all(s.bucket == "short" for s in full)
 
+    def test_longbench_picks_shortest_per_bucket(self, monkeypatch):
+        """When subsampling, pick the SHORTEST items per bucket.
+
+        v2's long bucket spans 167k–4M tokens; without sorting we'd hit Code-Repo
+        items with millions of tokens. Char count is the proxy used at selection
+        time (avoids tokenizing every candidate).
+        """
+        from benchmarks.quest_memory_probe import workload
+
+        # Three short items with descending context length. Pick first 2 by
+        # char count (shortest first).
+        items = [
+            {
+                "domain": "narrativeqa",
+                "length": "short",
+                "context": "x" * 5000,
+                "question": "q",
+                "choice_A": "a",
+                "choice_B": "b",
+                "choice_C": "c",
+                "choice_D": "d",
+            },
+            {
+                "domain": "narrativeqa",
+                "length": "short",
+                "context": "x" * 100,  # shortest
+                "question": "q",
+                "choice_A": "a",
+                "choice_B": "b",
+                "choice_C": "c",
+                "choice_D": "d",
+            },
+            {
+                "domain": "narrativeqa",
+                "length": "short",
+                "context": "x" * 1000,
+                "question": "q",
+                "choice_A": "a",
+                "choice_B": "b",
+                "choice_C": "c",
+                "choice_D": "d",
+            },
+        ]
+        monkeypatch.setattr(workload, "_load_dataset", lambda *a, **k: items)
+        monkeypatch.setattr(workload, "_read_template", lambda _: "$DOC$")
+        monkeypatch.setattr(
+            workload,
+            "_tokenize_count",
+            lambda prompt, model: len(prompt),
+        )
+
+        out = workload.load_samples("longbench:narrativeqa:lengths=short:n=2")
+        assert len(out) == 2
+        # Picked the 100-char and 1000-char items, in that order; the 5000-char
+        # one is skipped.
+        token_counts = sorted(s.prompt_tokens for s in out)
+        assert token_counts == [100, 1000]
+
 
 class FakeStats:
     block_filled = 1
@@ -407,8 +465,11 @@ class TestProbeSnapshot:
         assert snap["quest.topk_hit_ratio"] is None
         assert snap["vllm.gpu_kv_useful_bytes"] is None
         assert snap["quest.arena_total_bytes"] is None
-        assert snap["vllm.actual_used_bytes"] is None
-        assert snap["vllm.actual_used_peak_bytes"] is None
+        # Dense fallback: when scheduler bookkeeping is unreachable
+        # (kv_useful=None), actual_used uses torch.allocated_bytes directly.
+        # That's the authoritative figure for vLLM-held memory in dense mode.
+        assert snap["vllm.actual_used_bytes"] == 100
+        assert snap["vllm.actual_used_peak_bytes"] == 150
 
     def test_arena_total_sums_across_quest_layers(self):
         from benchmarks.quest_memory_probe import probes
@@ -847,6 +908,25 @@ class TestRunnerHelpers:
         kw = _make_engine_kwargs(cfg, quest_json_path=str(json_path))
         assert kw["enable_quest_sparse_offload"] is True
         assert kw["quest_config"] == str(json_path)
+
+    def test_make_engine_kwargs_no_hf_overrides_for_native_context(self):
+        from benchmarks.quest_memory_probe.configs import RunConfig
+        from benchmarks.quest_memory_probe.runner import _make_engine_kwargs
+
+        cfg = RunConfig(name="ok", max_model_len=131072)
+        kw = _make_engine_kwargs(cfg, quest_json_path=None)
+        assert "hf_overrides" not in kw
+
+    def test_make_engine_kwargs_injects_hf_overrides_when_extending(self):
+        # LongBench-v2 long bucket starts at ~167k tokens. Need to extend
+        # past Llama-3.2's native 131072. Probe must pass hf_overrides so
+        # vLLM doesn't refuse on context overflow.
+        from benchmarks.quest_memory_probe.configs import RunConfig
+        from benchmarks.quest_memory_probe.runner import _make_engine_kwargs
+
+        cfg = RunConfig(name="big", max_model_len=200000)
+        kw = _make_engine_kwargs(cfg, quest_json_path=None)
+        assert kw["hf_overrides"] == {"max_position_embeddings": 200000}
 
 
 class TestRunnerOomDetection:

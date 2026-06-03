@@ -231,17 +231,29 @@ def probe_snapshot(worker, bytes_per_block: int | None) -> dict[str, Any]:
     essential = allocated - pool_for_calc - arena_for_calc
     essential_peak = peak_allocated - pool_for_calc - arena_for_calc
 
-    # actual_used: Quest mode uses arena_total (the entire torch.empty buffer
-    # is "actually held by the process", not just the resident slots). Dense
-    # mode falls back to kv_useful (engine pool's used portion).
-    actual_used_kv = arena_total if tms else kv_useful
-
-    if actual_used_kv is None:
-        actual_used = None
-        actual_used_peak = None
+    # actual_used = process-resident KV bytes + essential.
+    # Quest: arena_total is the entire torch.empty buffer the process holds.
+    # Dense: kv_useful (engine pool's used portion) when scheduler bookkeeping
+    # is reachable; otherwise we fall back to torch.allocated_bytes — that's
+    # the authoritative figure for "bytes vLLM is currently holding" because
+    # dense has no private arenas outside the allocator.
+    if tms:
+        actual_used_kv = arena_total
+        actual_used = (
+            max(0, essential) + actual_used_kv if actual_used_kv is not None else None
+        )
+        actual_used_peak = (
+            max(0, essential_peak) + actual_used_kv
+            if actual_used_kv is not None
+            else None
+        )
     else:
-        actual_used = max(0, essential) + actual_used_kv
-        actual_used_peak = max(0, essential_peak) + actual_used_kv
+        if kv_useful is not None:
+            actual_used = max(0, essential) + kv_useful
+            actual_used_peak = max(0, essential_peak) + kv_useful
+        else:
+            actual_used = allocated
+            actual_used_peak = peak_allocated
 
     out["vllm.engine_essential_bytes"] = max(0, essential)
     out["vllm.engine_essential_peak_bytes"] = max(0, essential_peak)

@@ -195,6 +195,55 @@ def _tokenize_count(prompt: str, model: str) -> int:
     return len(tok(prompt, add_special_tokens=False)["input_ids"])
 
 
+def _load_samples_by_indices(
+    ds,
+    indices_env: str,
+    *,
+    template: str,
+    model: str,
+    task: str,
+) -> list[Sample]:
+    """Pick specific row indices from the LongBench-v2 split, in env order.
+
+    The index space here is the FILTERED list (rows with domain/sub_domain ==
+    `task`), so callers can say "the 3rd, 17th, 42nd SDQA item" without
+    knowing the row's position in the global 503-item dataset.
+    """
+    items = [
+        it
+        for it in ds
+        if it.get("domain") == task or it.get("sub_domain") == task
+    ]
+    if not items:
+        valid_domains = sorted({it.get("domain") for it in ds})
+        raise RuntimeError(
+            f"LongBench-v2 has no items with domain/sub_domain == "
+            f"{task!r}. Valid domains: {valid_domains}."
+        )
+    indices = [int(x) for x in indices_env.split(",") if x.strip()]
+    out: list[Sample] = []
+    for ord_pos, idx in enumerate(indices):
+        if not (0 <= idx < len(items)):
+            raise RuntimeError(
+                f"index {idx} out of range for task {task!r} "
+                f"(len={len(items)})"
+            )
+        item = items[idx]
+        prompt = _build_longbench_prompt(item, template)
+        tokens = _tokenize_count(prompt, model=model)
+        # Synthetic bucket label so downstream summary still groups sensibly.
+        bucket = bucket_for_tokens(min(tokens, (1 << 30) - 1))
+        out.append(
+            Sample(
+                sample_id=f"longbench/{task}/idx{idx}/pos{ord_pos}",
+                prompt=prompt,
+                prompt_tokens=tokens,
+                bucket=bucket,
+            )
+        )
+    return out
+
+
 def load_samples(
     spec_str: str,
     *,
@@ -205,6 +254,11 @@ def load_samples(
 
     QUEST_MEM_PROBE_FORCE_SYNTHETIC=1 in the env forces the fallback path
     (handy for unit tests and for cluster runs without HF Hub access).
+
+    QUEST_MEM_PROBE_LONGBENCH_INDICES=12,34,56 in the env overrides the
+    bucketing logic entirely and pulls those specific row indices from
+    LongBench-v2 (still filtered by spec.task domain). Used when you need
+    to hit precise token-length targets the bucket system can't express.
 
     longbench_full=True ignores the spec's `n=` cap and takes every item that
     falls into a requested bucket. Synthetic fallback ignores the flag.
@@ -232,6 +286,18 @@ def _load_samples_longbench(
 ) -> list[Sample]:
     template = _read_template("0shot.txt")
     ds = _load_dataset("THUDM/LongBench-v2", split="train")
+
+    # Optional escape hatch: pin a list of row indices via env, bypassing
+    # the bucket selection. Used to hit precise token-length targets that
+    # the LongBench-v2 length labels (short/medium/long) can't express
+    # — for example, picking exact 32k / 64k / 128k items for a
+    # context-length sweep on Llama-3.2-3B (native 131072).
+    indices_env = os.environ.get("QUEST_MEM_PROBE_LONGBENCH_INDICES")
+    if indices_env:
+        return _load_samples_by_indices(
+            ds, indices_env, template=template, model=model, task=spec.task
+        )
+
     # LongBench-v2 schema: domain ∈ {'Single-Document QA',
     # 'Multi-Document QA', 'Long In-context Learning',
     # 'Code Repository Understanding', 'Long-dialogue History Understanding',
@@ -261,6 +327,16 @@ def _load_samples_longbench(
     # raise below — use synthetic for xlong workloads.
     requested_buckets = set(spec.buckets)
     items = [it for it in items if it.get("length") in requested_buckets]
+
+    # When subsampling (longbench_full=False), pick the SHORTEST items per
+    # bucket. v2's long bucket spans 167k–4M tokens; without this sort we'd
+    # tokenize and try to prefill 4M-token Code-Repo dumps that no GPU can
+    # hold. Char count is a monotonic proxy for tokens — sorting on chars
+    # and tokenizing only the first N keeps cost bounded. longbench_full
+    # still walks every item (callers asking for the full set accept the
+    # cost).
+    if not longbench_full:
+        items = sorted(items, key=lambda it: len(it.get("context", "")))
 
     # Render + tokenize: tokenize is only for filling Sample.prompt_tokens
     # (informational; not used for bucketing).
