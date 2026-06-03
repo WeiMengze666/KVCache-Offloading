@@ -114,6 +114,13 @@ class QuestConfig:
        benchmarking the overlap fraction on your model.** Phase D may
        add an overlap-threshold gate; until then, Mode 2 is best left
        at 0.
+
+       Stage 3 update: the block_ordering axis ({lru, prefetch, mixture}) is the
+       supported way to use cross-layer prefetch. Under "mixture", eviction
+       prefers non-prev-selected victims, so a wrong speculation costs at most one
+       extra refetch (not the unbounded 2x of the old pure-LRU-thrash model). The
+       effective window is min(prefetch_window_blocks, top_k), backfilled to top_k
+       when left at 0. See teamdocs/stage3-design.md.
     """
 
     # Stage 3 block-ordering axis. `block_ordering` selects the decode-time
