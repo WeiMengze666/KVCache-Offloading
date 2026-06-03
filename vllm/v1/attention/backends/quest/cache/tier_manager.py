@@ -729,7 +729,9 @@ class TierManager:
             cpu_slot = self._cpu_slots.pop(key, None)
         if cpu_slot is None:
             raise RuntimeError(f"block {key} is neither on GPU nor in CPU pool")
-        slot, evicted = self._slot_map.add(key)
+        slot, evicted = self._slot_map.add(
+            key, protected=self._protected_keys(seq_id)
+        )
         if evicted is not None:
             self.spill_hook(*evicted, slot=slot)
         self.residency.begin_load(self.layer_idx, bid)
@@ -757,7 +759,9 @@ class TierManager:
             cpu_slot = self._cpu_slots.pop(key, None)
         if cpu_slot is None:
             raise RuntimeError(f"block {key} is neither on GPU nor in CPU pool")
-        slot, evicted = self._slot_map.add(key)
+        slot, evicted = self._slot_map.add(
+            key, protected=self._protected_keys(seq_id)
+        )
         if evicted is not None:
             self.spill_hook(*evicted, slot=slot)
         # Residency state machine update fires synchronously, BEFORE the
@@ -916,6 +920,14 @@ class TierManager:
         with torch.cuda.stream(self.stream_pool.h2d_stream):
             for bid in ids:
                 self._ensure_one_async(seq_id, bid)
+                # no-touch: a speculatively-prefetched block the current layer
+                # has not selected yet stays at the LRU tail, so a wrong guess
+                # is first evicted next time room is needed. touch keeps the
+                # default add() landing (MRU) so a trusted guess is protected.
+                if not self.prefetch_touch and (seq_id, bid) in self._slot_map:
+                    self._slot_map._key_to_slot.move_to_end(
+                        (seq_id, bid), last=False
+                    )
         event = self.stream_pool.record_h2d_done()
         self.stream_pool.register_prefetch_event(
             seq_id=seq_id,

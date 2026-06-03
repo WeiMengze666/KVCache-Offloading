@@ -86,3 +86,30 @@ def test_free_request_clears_prev_selected():
     tm.set_prev_selected(seq_id=7, block_ids=[1, 2])
     tm.free_request(7)
     assert 7 not in tm._prev_selected
+
+
+def _fill_block(tm, seq_id, bid):
+    bs, h_kv, hd = tm.gpu_k.shape[1], tm.gpu_k.shape[2], tm.gpu_k.shape[3]
+    k = torch.ones(bs, h_kv, hd, dtype=torch.float16, device="cuda")
+    v = torch.ones_like(k)
+    tm.on_block_filled(seq_id=seq_id, logical_block_id=bid, k_block=k, v_block=v)
+
+
+def test_mixture_eviction_skips_prev_selected():
+    # Fill the arena, protect the LRU tail, force an add -> the victim must be
+    # the non-protected newer block, not the protected oldest one.
+    tm = _tm(cap=2, block_ordering="mixture", prefetch_touch=False)
+    _fill_block(tm, seq_id=0, bid=0)  # oldest
+    _fill_block(tm, seq_id=0, bid=1)  # newer
+    tm.set_prev_selected(seq_id=0, block_ids=[0])  # protect (0,0)
+    slot, evicted = tm._slot_map.add((0, 2), protected=tm._protected_keys(0))
+    assert evicted == (0, 1)
+
+
+def test_lru_eviction_unaffected_by_prev_selected():
+    # Under lru, _protected_keys is empty -> pure LRU victim (the oldest).
+    tm = _tm(cap=2, block_ordering="lru")
+    _fill_block(tm, seq_id=0, bid=0)  # oldest
+    _fill_block(tm, seq_id=0, bid=1)
+    slot, evicted = tm._slot_map.add((0, 2), protected=tm._protected_keys(0))
+    assert evicted == (0, 0)
