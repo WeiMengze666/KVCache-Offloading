@@ -344,6 +344,9 @@ class TestProbeSnapshot:
         assert snap["quest.gpu_resident_blocks"] is None
         assert snap["quest.topk_hit_ratio"] is None
         assert snap["vllm.gpu_kv_useful_bytes"] is None
+        assert snap["quest.arena_total_bytes"] is None
+        assert snap["vllm.actual_used_bytes"] is None
+        assert snap["vllm.actual_used_peak_bytes"] is None
 
     def test_arena_total_sums_across_quest_layers(self):
         from benchmarks.quest_memory_probe import probes
@@ -359,6 +362,100 @@ class TestProbeSnapshot:
         from benchmarks.quest_memory_probe import probes
 
         assert probes._arena_total_bytes([]) == 0
+
+    def test_essential_subtracts_arena_in_quest_mode(self, monkeypatch):
+        from benchmarks.quest_memory_probe import probes
+
+        # torch.allocated must exceed kv_pool + arena so essential stays
+        # positive (probe clamps to 0 otherwise).
+        monkeypatch.setattr(
+            probes,
+            "_torch_metrics",
+            lambda: {
+                "torch.allocated_bytes": 15 * 1024**3,
+                "torch.reserved_bytes": 16 * 1024**3,
+                "torch.peak_allocated_bytes": 17 * 1024**3,
+                "torch.active_bytes": 15 * 1024**3,
+            },
+        )
+        monkeypatch.setattr(
+            probes,
+            "_nvml_metrics",
+            lambda: {"nvml.gpu_used_bytes": 0, "nvml.gpu_total_bytes": 0},
+        )
+        # Two layers × per-layer arena = 2 * 2_097_152 * 2 = 8_388_608 bytes
+        # (cap=16, bs=256, h=4, d=64, fp16; ×2 for K+V; ×2 layers)
+        tms = [FakeTM(0, 5, 0), FakeTM(1, 5, 0)]
+        worker = FakeWorker(tms)  # available_kv_cache_memory_bytes = 10 GiB
+        snap = probes.probe_snapshot(worker, bytes_per_block=4096)
+
+        arena_total = 8_388_608
+        kv_pool = 10 * 1024**3
+        # essential = torch.allocated - kv_pool - arena_total
+        assert snap["quest.arena_total_bytes"] == arena_total
+        assert snap["vllm.engine_essential_bytes"] == (
+            15 * 1024**3 - kv_pool - arena_total
+        )
+        # actual_used = essential + arena_total
+        assert snap["vllm.actual_used_bytes"] == (
+            snap["vllm.engine_essential_bytes"] + arena_total
+        )
+        # peak essential uses torch.peak_allocated_bytes instead
+        assert snap["vllm.engine_essential_peak_bytes"] == (
+            17 * 1024**3 - kv_pool - arena_total
+        )
+        assert snap["vllm.actual_used_peak_bytes"] == (
+            snap["vllm.engine_essential_peak_bytes"] + arena_total
+        )
+
+    def test_actual_used_dense_path_uses_kv_useful(self, monkeypatch):
+        from benchmarks.quest_memory_probe import probes
+
+        monkeypatch.setattr(
+            probes,
+            "_torch_metrics",
+            lambda: {
+                "torch.allocated_bytes": 8 * 1024**3,
+                "torch.reserved_bytes": 9 * 1024**3,
+                "torch.peak_allocated_bytes": 9 * 1024**3,
+                "torch.active_bytes": 8 * 1024**3,
+            },
+        )
+        monkeypatch.setattr(
+            probes,
+            "_nvml_metrics",
+            lambda: {"nvml.gpu_used_bytes": 0, "nvml.gpu_total_bytes": 0},
+        )
+
+        class DenseScheduler:
+            class _Mgr:
+                num_used_blocks = 100
+
+            kv_cache_manager = _Mgr()
+
+        class DenseRunner:
+            model_memory_usage = 6 * 1024**3
+
+        class DenseWorker:
+            model_runner = DenseRunner()
+            available_kv_cache_memory_bytes = 4 * 1024**3
+            scheduler = DenseScheduler()
+
+        snap = probes.probe_snapshot(DenseWorker(), bytes_per_block=4096)
+
+        # Dense: arena_total is None (no Quest), kv_useful = 100 * 4096
+        assert snap["quest.arena_total_bytes"] is None
+        kv_useful = 100 * 4096
+        # essential = torch.allocated - kv_pool - 0
+        expected_essential = 8 * 1024**3 - 4 * 1024**3
+        assert snap["vllm.engine_essential_bytes"] == expected_essential
+        assert snap["vllm.actual_used_bytes"] == expected_essential + kv_useful
+        # Peak uses torch.peak_allocated_bytes (9 GiB here)
+        expected_essential_peak = 9 * 1024**3 - 4 * 1024**3
+        assert snap["vllm.engine_essential_peak_bytes"] == expected_essential_peak
+        assert snap["vllm.actual_used_peak_bytes"] == (
+            expected_essential_peak + kv_useful
+        )
 
 
 class TestSampler:
