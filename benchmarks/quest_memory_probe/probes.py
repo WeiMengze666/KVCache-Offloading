@@ -143,6 +143,23 @@ def _vllm_kv_pool_bytes(worker) -> int | None:
     return int(v) if v else None
 
 
+def _arena_total_bytes(tms: list[Any]) -> int:
+    """Total bytes of all Quest TierManager `gpu_k` + `gpu_v` arenas.
+
+    The Quest arena is allocated via `torch.empty` in
+    vllm/v1/attention/backends/quest/backend.py (Stage 2A+ private buffer,
+    no aliasing). It lives outside `available_kv_cache_memory_bytes` and
+    must be subtracted from `torch.allocated_bytes` to get a clean
+    weights+workspace `essential` figure. K and V are equally sized, so
+    we use `gpu_k.numel() * element_size() * 2`.
+    """
+    total = 0
+    for tm in tms:
+        k = tm.gpu_k
+        total += int(k.numel()) * int(k.element_size()) * 2
+    return total
+
+
 def _dense_kv_useful_bytes(worker, bytes_per_block: int | None) -> int | None:
     if bytes_per_block is None:
         return None
@@ -187,6 +204,7 @@ def probe_snapshot(worker, bytes_per_block: int | None) -> dict[str, Any]:
         or 0
     )
     kv_pool_total = _vllm_kv_pool_bytes(worker)
+    arena_total = _arena_total_bytes(tms) if tms else None
     if tms:
         if bytes_per_block is None:
             kv_useful = None
@@ -202,13 +220,39 @@ def probe_snapshot(worker, bytes_per_block: int | None) -> dict[str, Any]:
         slack = None
         slack_ratio = None
 
-    essential = out["torch.allocated_bytes"] - (kv_pool_total or 0)
+    # essential = torch.allocated - kv_pool_total - arena_total
+    # In Quest mode the arena is a private torch.empty allocation NOT covered
+    # by available_kv_cache_memory_bytes; subtract it explicitly so essential
+    # reflects only weights + workspace.
+    allocated = out["torch.allocated_bytes"]
+    peak_allocated = out["torch.peak_allocated_bytes"]
+    pool_for_calc = kv_pool_total or 0
+    arena_for_calc = arena_total or 0
+    essential = allocated - pool_for_calc - arena_for_calc
+    essential_peak = peak_allocated - pool_for_calc - arena_for_calc
+
+    # actual_used: Quest mode uses arena_total (the entire torch.empty buffer
+    # is "actually held by the process", not just the resident slots). Dense
+    # mode falls back to kv_useful (engine pool's used portion).
+    actual_used_kv = arena_total if tms else kv_useful
+
+    if actual_used_kv is None:
+        actual_used = None
+        actual_used_peak = None
+    else:
+        actual_used = max(0, essential) + actual_used_kv
+        actual_used_peak = max(0, essential_peak) + actual_used_kv
+
     out["vllm.engine_essential_bytes"] = max(0, essential)
+    out["vllm.engine_essential_peak_bytes"] = max(0, essential_peak)
     out["vllm.kv_pool_total_bytes"] = kv_pool_total
     out["vllm.gpu_kv_useful_bytes"] = kv_useful
     out["vllm.kv_pool_slack_bytes"] = slack
     out["vllm.kv_pool_slack_ratio"] = slack_ratio
     out["vllm.weights_bytes"] = weights
+    out["quest.arena_total_bytes"] = arena_total
+    out["vllm.actual_used_bytes"] = actual_used
+    out["vllm.actual_used_peak_bytes"] = actual_used_peak
     return out
 
 

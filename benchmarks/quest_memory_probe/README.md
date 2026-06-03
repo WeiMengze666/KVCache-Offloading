@@ -78,21 +78,58 @@ out_dir/
 └── report.md
 ```
 
-## 三个关键字段
+## 显存分布与关键字段
 
-- **`vllm.gpu_kv_useful_bytes`** — KV 池里真正承载有效 KV 数据的字节数。
-  Quest 卸载越激烈这个越小。
-- **`vllm.kv_pool_slack_bytes`** — vLLM 预留池里没被占用的部分。
-  Dense ≈ 0；Quest+offload 应显著 > 0。
+Stage 2A+ 起 Quest arena 是私有 `torch.empty` 分配（见
+`vllm/v1/attention/backends/quest/backend.py:305,327`），与 vLLM engine
+预留的 KV 池是**两块独立显存**：
+
+```text
+torch.allocated_bytes
+  = weights + workspace          ← vllm.engine_essential_bytes
+  + engine_kv_pool_total         ← vllm.kv_pool_total_bytes
+  + quest_arena_total            ← quest.arena_total_bytes (Quest 模式)
+```
+
+- **`vllm.actual_used_bytes`** = `essential + arena_total`（Quest）
+  / `essential + kv_useful`（Dense）。
+  这是"vLLM 进程实际持有的、必须的 GPU 显存"——含 weights、workspace、
+  以及 Quest 自己用 `torch.empty` 申请来给 decode 用的整块 KV 缓存。
+- **`vllm.actual_used_peak_bytes`** — 同上，但 essential 部分用
+  `torch.peak_allocated_bytes`，能反映 prefill spike 期间的最高水位。
+- **`quest.arena_total_bytes`** — Quest 私有 arena 字节总和（K+V，跨所有
+  Quest 层）。常量，由 `gpu_cache_blocks_per_seq × bpb × num_quest_layers`
+  决定。
+- **`vllm.gpu_kv_useful_bytes`** (= arena_resident in Quest mode)
+  — arena 里被某个 (seq, block) 占着的 slot 字节数。辅助观察 arena 内部
+  占用率，**不进入 actual_used**。
 - **`quest.topk_hit_ratio`** — 每次 selection 时 top-k 已驻留 GPU 的比例。
   池越小 → 命中率越低 → H2D 越频繁。
 
+### 采样时机限制
+
+当前 probe 在每个样本窗口里只在 `sample_start` 之前 + `generate()` 之后
+各采一次（`runner.py:163,193,202`），不是周期采样——因为 worker 的
+collective_rpc 输入 socket 与 engine 请求流共用，并发会让 IPC frame 崩。
+所以：
+
+- `peak_actual_used_bytes`（窗口取 max，口径 A）= 这两个采样点的较大者，
+  **不会捕到 prefill 中段峰**。
+- `peak_actual_used_peak_bytes`（基于 `torch.peak_allocated_bytes`，
+  口径 B）= 真实的 generate 期间最高水位，含 prefill 峰。runner 在每个
+  sample 前调 `reset_peak_stats`，所以这个值就是该样本期间的真峰。
+
+要看真峰用口径 B；口径 A 留作对照（generate 前后 settled 状态）。
+
 ## 手动验证 checklist
 
-跑完一次 `compare-pool-size` 后看 `kv_pool_breakdown.png`：
+跑完一次 `compare-pool-size` 后：
 
-- [ ] dense cfg 的 `kv_slack` ≈ 0（vLLM 默认把池占满）
-- [ ] quest pool=16 的 `kv_slack` 显著 > 0（卸载工程价值的实证）
+- [ ] dense cfg 的 `actual_used_bytes` ≈ `weights + small workspace +
+      kv_useful`，应略大于 `weights_bytes`
+- [ ] quest cfg 随 `gpu_cache_blocks_per_seq` 缩小，`actual_used_bytes`
+      单调下降，但不低于 `weights_bytes`
+- [ ] `actual_used_peak_bytes` ≥ `actual_used_bytes`（峰值 ≥ settled）
 - [ ] top-k 命中率随 pool 缩小而下降的趋势是平滑的，不应突然跌到 0
 
 如果观察到的是反的（pool 缩小后 slack 没增加），先排查：
