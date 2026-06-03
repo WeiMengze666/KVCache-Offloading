@@ -252,30 +252,29 @@ def _load_samples_longbench(
             "Pass a real domain or set QUEST_MEM_PROBE_FORCE_SYNTHETIC=1."
         )
 
-    # Pre-filter by LongBench-v2's own length field. Our token-based buckets
-    # may classify some items differently (v2 'short' can be 30k+ tokens),
-    # but using v2 length as a candidate filter cuts tokenize work from ~503
-    # items to <100. Skip when the spec asks for buckets v2 doesn't label
-    # (e.g. xlong) or when --longbench-full is on.
-    v2_length_for_buckets = {"short", "medium", "long"} & set(spec.buckets)
-    if v2_length_for_buckets and not longbench_full:
-        items = [it for it in items if it.get("length") in v2_length_for_buckets]
+    # Pre-filter by LongBench-v2's own length field. v2 labels items as
+    # short/medium/long; we trust those labels rather than re-bucketing on
+    # tokenized lengths (v2 'short' includes items up to ~32k tokens, which
+    # would land in our 'medium' bucket and leave 'short' empty). Items in
+    # buckets the spec doesn't request are skipped here. xlong has no v2
+    # equivalent, so xlong-only specs against LongBench yield 0 samples and
+    # raise below — use synthetic for xlong workloads.
+    requested_buckets = set(spec.buckets)
+    items = [it for it in items if it.get("length") in requested_buckets]
 
-    # Render + tokenize. We do NOT keep all items in memory — bucket as we go.
+    # Render + tokenize: tokenize is only for filling Sample.prompt_tokens
+    # (informational; not used for bucketing).
     by_bucket: dict[str, list[Sample]] = {b: [] for b in spec.buckets}
     for idx, item in enumerate(items):
         if not longbench_full and all(len(v) >= spec.n for v in by_bucket.values()):
             break
-        prompt = _build_longbench_prompt(item, template)
-        tokens = _tokenize_count(prompt, model=model)
-        try:
-            bucket = bucket_for_tokens(tokens)
-        except ValueError:
-            continue
+        bucket = item.get("length")
         if bucket not in by_bucket:
             continue
         if not longbench_full and len(by_bucket[bucket]) >= spec.n:
             continue
+        prompt = _build_longbench_prompt(item, template)
+        tokens = _tokenize_count(prompt, model=model)
         by_bucket[bucket].append(
             Sample(
                 sample_id=f"longbench/{spec.task}/{bucket}/{idx}",

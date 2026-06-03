@@ -243,6 +243,7 @@ class TestLongBenchLoader:
         items = [
             {
                 "domain": "narrativeqa",
+                "length": "short",
                 "context": f"ctx-{i}",
                 "question": "q",
                 "choice_A": "a",
@@ -254,7 +255,8 @@ class TestLongBenchLoader:
         ]
         monkeypatch.setattr(workload, "_load_dataset", lambda *a, **k: items)
         monkeypatch.setattr(workload, "_read_template", lambda _: "$DOC$")
-        # Tokenize: 100 tokens → short bucket regardless of input.
+        # tokenize is no longer used for bucketing, but we still call it for
+        # Sample.prompt_tokens — return a constant.
         monkeypatch.setattr(workload, "_tokenize_count", lambda prompt, model: 100)
 
         capped = workload.load_samples("longbench:narrativeqa:lengths=short:n=1")
