@@ -232,11 +232,34 @@ def _load_samples_longbench(
 ) -> list[Sample]:
     template = _read_template("0shot.txt")
     ds = _load_dataset("THUDM/LongBench-v2", split="train")
-    # Filter by task domain. LongBench-v2 uses 'domain' / 'sub_domain'; if
-    # spec.task doesn't match exact domain, fall back to including everything.
-    items = [it for it in ds if it.get("domain") == spec.task]
+    # LongBench-v2 schema: domain ∈ {'Single-Document QA',
+    # 'Multi-Document QA', 'Long In-context Learning',
+    # 'Code Repository Understanding', 'Long-dialogue History Understanding',
+    # 'Long Structured Data Understanding'}; length ∈ {'short','medium','long'}.
+    # Accept either canonical domain or sub_domain. If task matches nothing,
+    # fail fast — silently falling back to the full corpus tokenizes hundreds
+    # of 100k+ token contexts and burns ~10 minutes per cfg.
+    items = [
+        it
+        for it in ds
+        if it.get("domain") == spec.task or it.get("sub_domain") == spec.task
+    ]
     if not items:
-        items = list(ds)
+        valid_domains = sorted({it.get("domain") for it in ds})
+        raise RuntimeError(
+            f"LongBench-v2 has no items with domain/sub_domain == "
+            f"{spec.task!r}. Valid domains: {valid_domains}. "
+            "Pass a real domain or set QUEST_MEM_PROBE_FORCE_SYNTHETIC=1."
+        )
+
+    # Pre-filter by LongBench-v2's own length field. Our token-based buckets
+    # may classify some items differently (v2 'short' can be 30k+ tokens),
+    # but using v2 length as a candidate filter cuts tokenize work from ~503
+    # items to <100. Skip when the spec asks for buckets v2 doesn't label
+    # (e.g. xlong) or when --longbench-full is on.
+    v2_length_for_buckets = {"short", "medium", "long"} & set(spec.buckets)
+    if v2_length_for_buckets and not longbench_full:
+        items = [it for it in items if it.get("length") in v2_length_for_buckets]
 
     # Render + tokenize. We do NOT keep all items in memory — bucket as we go.
     by_bucket: dict[str, list[Sample]] = {b: [] for b in spec.buckets}

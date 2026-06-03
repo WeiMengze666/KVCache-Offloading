@@ -276,5 +276,11 @@ def run_in_child(cfg_dict: dict, out_dir_str: str) -> None:
     can re-import it across the pickling boundary when the parent was launched
     via `python -m benchmarks.quest_memory_probe`.
     """
+    # vLLM v1 spawns an EngineCore subprocess; if it inherits the default 'fork'
+    # start method, init_device hits "Cannot re-initialize CUDA in forked
+    # subprocess" because this child has already touched CUDA (NVML probe etc.).
+    # Force spawn via vLLM's own env knob — must be set BEFORE the deferred
+    # `from vllm import LLM` inside execute().
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     cfg = RunConfig.from_dict(cfg_dict)
     execute(cfg, Path(out_dir_str))

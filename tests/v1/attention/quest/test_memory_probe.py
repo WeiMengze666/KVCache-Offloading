@@ -207,6 +207,33 @@ class TestLongBenchLoader:
         assert len(samples) == 1
         assert samples[0].sample_id.startswith("synthetic/")
 
+    def test_longbench_fails_fast_on_unknown_task(self, monkeypatch):
+        from benchmarks.quest_memory_probe import workload
+
+        # v2 schema has 'Single-Document QA', etc. — 'narrativeqa' is a v1
+        # name and never matches. Old behavior tokenized the whole 503-item
+        # corpus before giving up; new behavior should raise immediately.
+        items = [
+            {
+                "domain": "Single-Document QA",
+                "sub_domain": "Academic",
+                "length": "short",
+            },
+            {
+                "domain": "Multi-Document QA",
+                "sub_domain": "Financial",
+                "length": "long",
+            },
+        ]
+        monkeypatch.setattr(workload, "_load_dataset", lambda *a, **k: items)
+        monkeypatch.setattr(workload, "_read_template", lambda _: "$DOC$")
+
+        with pytest.raises(RuntimeError, match="no items with domain/sub_domain"):
+            workload._load_samples_longbench(
+                workload.parse_spec("longbench:narrativeqa:lengths=short:n=1"),
+                model="ignored",
+            )
+
     def test_longbench_full_ignores_n_cap(self, monkeypatch):
         from benchmarks.quest_memory_probe import workload
 
